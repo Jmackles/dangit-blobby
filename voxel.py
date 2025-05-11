@@ -2,8 +2,8 @@ import pygame
 import math
 
 # --- Constants ---
-SCREEN_WIDTH = 800
-SCREEN_HEIGHT = 600
+SCREEN_WIDTH = 1000
+SCREEN_HEIGHT = 900
 TOOLBAR_HEIGHT = 40 # Height for our simple toolbar
 GAME_SCREEN_HEIGHT = SCREEN_HEIGHT - TOOLBAR_HEIGHT
 
@@ -14,17 +14,41 @@ BROWN = (139, 69, 19)
 TOOLBAR_COLOR = (50, 50, 50)
 TEXT_COLOR = (200, 200, 200)
 
-VOXEL_SIZE = 20 # This is more of a conceptual unit now, projection handles actual screen size
+VOXEL_SIZE = 10 # This is more of a conceptual unit now, projection handles actual screen size
 ISO_TILE_WIDTH_HALF_BASE = VOXEL_SIZE * 0.866 # Base for zoom
 ISO_TILE_HEIGHT_HALF_BASE = VOXEL_SIZE * 0.5   # Base for zoom
 ISO_Z_FACTOR_BASE = VOXEL_SIZE                # Base for zoom
 
 
-GROUND_RANGE = 30
+GROUND_RANGE = 60
 
 # --- Global Variables ---
 zoom = 1.0
 light_direction = [-0.577, -0.577, 0.577] # Normalized default: up-left-ish
+
+# --- Helper Functions (moved earlier for use in global constants) ---
+def normalize_vector(v):
+    mag = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+    if mag == 0:
+        return (0, 0, 0) # Or raise an error, or return v
+    return (v[0]/mag, v[1]/mag, v[2]/mag)
+
+# --- Optimization: Pre-calculated relative corner offsets for voxel faces ---
+# Relative to the voxel's origin (ix, iy, iz), assuming s=1
+VOXEL_CORNER_OFFSETS = {
+    "iso_top":    [(0,0,1), (0,1,1), (1,1,1), (1,0,1)],
+    "iso_bottom": [(1,0,0), (1,1,0), (0,1,0), (0,0,0)], # Reversed for CCW from bottom
+    "iso_left_side": [(0,0,0), (0,1,0), (0,1,1), (0,0,1)],
+    "iso_right_side":[(1,0,1), (1,1,1), (1,1,0), (1,0,0)],
+    "iso_front_side":[(0,1,1), (0,1,0), (1,1,0), (1,1,1)], # Assuming +Y is front
+    "iso_back_side": [(0,0,1), (1,0,1), (1,0,0), (0,0,0)],  # Assuming -Y is back
+}
+
+# --- Optimization: View direction for back-face culling ---
+# Approximates the direction the camera is looking from, towards the origin.
+# Used to determine if a face normal is pointing towards the camera.
+VIEW_DIRECTION_FOR_CULLING = normalize_vector((1, 1, 0.8)) # Tuned for typical isometric view
+CULLING_THRESHOLD = 0.05 # Small positive threshold to avoid z-fighting or shimmering at edges
 
 # Face normals (world space - assuming standard voxel orientation)
 FACE_NORMALS = {
@@ -44,13 +68,14 @@ light_mode = False         # When True, next click in game sets light source
 light_source_pos = None    # World XY position for the light
 
 # --- Updated Physics Constants (frame-rate independent) ---
-BASE_ACCEL_RATE = 10.0      # units/sec^2
-FAST_ACCEL_RATE = 20.0      # units/sec^2
-BASE_MAX_SPEED_UPS = 3.0    # units/sec
-FAST_MAX_SPEED_UPS = 6.0    # units/sec
-DAMPING_FACTOR = 5.0        # Affects how quickly player slows down
+BASE_ACCEL_RATE = 12.0      # increased from 8.0 for more responsive acceleration
+FAST_ACCEL_RATE = 16.0      # increased from 10.0
+BASE_MAX_SPEED_UPS = 30.0   # increased from 18.0
+FAST_MAX_SPEED_UPS = 50.0   # increased from 35.0
+DAMPING_FACTOR = 6.0        # Affects how quickly player slows down
+MASS = 1.0                 # New mass constant for momentum calculations
 
-GRAVITY_ACCEL = -25.0       # units/sec^2 (Increased for less floaty feel)
+GRAVITY_ACCEL = -20.0       # units/sec^2 (Increased for less floaty feel)
 INITIAL_JUMP_VELOCITY_UPS = 10.0 # units/sec (Increased for stronger initial jump)
 JUMP_CHARGE_BOOST_ACCEL_RATE = 20.0 # units/sec^2 (Increased boost while charging)
 MAX_JUMP_CHARGE_DURATION = 0.8   # seconds (Max time space can be held for boost)
@@ -64,7 +89,7 @@ REST_VELOCITY_THRESHOLD = 0.5   # Below this speed, player is considered at rest
 # --- Updated Jump and Elasticity Variables ---
 elasticity = 6.0            # Rate at which blob returns to normal shape (increased for faster recovery)
 SQUISH_ON_JUMP_START = 0.8  # Less squish on jump start (closer to 1.0)
-SQUISH_ON_LANDING = 0.6     # More squish on landing (when velocity is high)
+SQUISH_ON_LANDING = 0.95    # Increased from 0.8 to reduce flattening effect
 MAX_SQUISH_FROM_CHARGE = 0.4 # Deepest squish when fully charged
 SQUISH_DAMPING = 8.0        # Prevents rapid oscillation in squish
 
@@ -104,11 +129,11 @@ def quat_rotate_point(q, point):
     return (p_rot[1], p_rot[2], p_rot[3])
 
 # --- Helper Functions ---
-def normalize_vector(v):
-    mag = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
-    if mag == 0:
-        return (0, 0, 0) # Or raise an error, or return v
-    return (v[0]/mag, v[1]/mag, v[2]/mag)
+# def normalize_vector(v): # Moved to earlier in the script
+#     mag = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
+#     if mag == 0:
+#         return (0, 0, 0) # Or raise an error, or return v
+#     return (v[0]/mag, v[1]/mag, v[2]/mag)
 
 def project_iso(ix, iy, iz, current_zoom):
     """Converts 3D VOXEL INDICES (ix, iy, iz) to 2D isometric screen coordinates, applying zoom."""
@@ -118,21 +143,13 @@ def project_iso(ix, iy, iz, current_zoom):
     iso_z_factor = ISO_Z_FACTOR_BASE * current_zoom
     screen_x = (ix - iy) * iso_tile_width_half
     screen_y = (ix + iy) * iso_tile_height_half - iz * iso_z_factor
-    return int(screen_x), int(screen_y)
+    # Return as floats for precision, convert to int just before drawing
+    return screen_x, screen_y
 
 def get_voxel_face_points_from_indices(ix, iy, iz, face_key):
-    s = 1
-    corners_idx = [
-        (ix, iy, iz), (ix, iy + s, iz), (ix + s, iy + s, iz), (ix + s, iy, iz),
-        (ix, iy, iz + s), (ix, iy + s, iz + s), (ix + s, iy + s, iz + s), (ix + s, iy, iz + s)
-    ]
-    if face_key == "iso_top": return [corners_idx[4], corners_idx[5], corners_idx[6], corners_idx[7]]
-    elif face_key == "iso_bottom": return [corners_idx[3], corners_idx[2], corners_idx[1], corners_idx[0]]
-    elif face_key == "iso_left_side": return [corners_idx[0], corners_idx[1], corners_idx[5], corners_idx[4]]
-    elif face_key == "iso_right_side": return [corners_idx[7], corners_idx[6], corners_idx[2], corners_idx[3]]
-    elif face_key == "iso_front_side": return [corners_idx[5], corners_idx[1], corners_idx[2], corners_idx[6]]
-    elif face_key == "iso_back_side": return [corners_idx[4], corners_idx[7], corners_idx[3], corners_idx[0]]
-    return []
+    """ Optimized: uses pre-calculated offsets. ix, iy, iz are the base coords (e.g., bottom-left-back corner)."""
+    offsets = VOXEL_CORNER_OFFSETS[face_key]
+    return [(ix + off[0], iy + off[1], iz + off[2]) for off in offsets]
 
 def compute_face_color_with_normal(base_color, face_normal_world, light_dir_normalized):
     dot_product = (face_normal_world[0] * light_dir_normalized[0] +
@@ -145,11 +162,37 @@ def compute_face_color_with_normal(base_color, face_normal_world, light_dir_norm
             min(255, int(base_color[1] * brightness)),
             min(255, int(base_color[2] * brightness)))
 
+# Add these global caching variables at the top (after other globals)
+cached_ground_surface = None
+cached_ground_zoom = -1
+cached_camera_offset = (None, None)
+GROUND_CACHE_MARGIN = 100  # extra pixels to cover shifting
+
+def render_ground_surface(draw_origin_x, draw_origin_y, current_zoom, ground_level_z_val):
+    global cached_ground_surface, cached_ground_zoom, cached_camera_offset
+    surface_width = SCREEN_WIDTH + GROUND_CACHE_MARGIN
+    surface_height = GAME_SCREEN_HEIGHT + GROUND_CACHE_MARGIN
+    surf = pygame.Surface((surface_width, surface_height))
+    # Compute a large ground polygon so that no background is exposed.
+    R = int(GROUND_RANGE * 1.5)  # Extended range for full coverage
+    corners = [
+        (-R, -R, ground_level_z_val),
+        (R, -R, ground_level_z_val),
+        (R, R, ground_level_z_val),
+        (-R, R, ground_level_z_val)
+    ]
+    proj_corners = [project_iso(cx, cy, cz, current_zoom) for (cx, cy, cz) in corners]
+    shifted = [(int(pt[0] + draw_origin_x), int(pt[1] + draw_origin_y)) for pt in proj_corners]
+    color = compute_face_color_with_normal(BROWN, FACE_NORMALS["iso_top"], light_direction)
+    pygame.draw.polygon(surf, color, shifted)
+    return surf
+
 # --- Main Game Logic ---
 def main():
     global zoom, light_direction, player_rotation, light_mode, light_source_pos, \
            squish, jump_charge_start_time, is_charging_jump, is_on_ground, \
            target_squish, squish_velocity
+    global cached_ground_surface, cached_ground_zoom, cached_camera_offset  # Added caching globals
     pygame.init()
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT))
     game_surface = pygame.Surface((SCREEN_WIDTH, GAME_SCREEN_HEIGHT))
@@ -157,12 +200,15 @@ def main():
     pygame.display.set_caption("Voxel Planetoid Controls - Phase 3")
     clock = pygame.time.Clock()
     font = pygame.font.Font(None, 24)
-    
-    # --- Player Sphere Generation ---
+    font_big = pygame.font.Font(None, 48)
+
+    # --- QoL/UX State ---
+    show_help = False
+    paused = False
+    current_fps = 0 # For FPS display
     player_voxels_shape = [] # Stores (rel_ix, rel_iy, rel_iz_shape, base_color)
     radius = 6
-    # sphere_vertical_offset is the Z-index of the sphere's bottom-most voxel when resting
-    sphere_vertical_offset = 0 # Let player_pos_world handle the actual Z position
+    # sphere_vertical_offset was here, removed as unused
     for i in range(-radius, radius + 1):
         for j in range(-radius, radius + 1):
             for k in range(-radius, radius + 1): # k is relative to sphere's center
@@ -171,8 +217,9 @@ def main():
                     # Store relative to sphere's own (0,0,0) center for shape definition
                     player_voxels_shape.append((i, j, k, GREEN_BASE))
 
-    # Set for culling, using relative coordinates
-    voxel_set_player_shape = {(v[0], v[1], v[2]) for v in player_voxels_shape}
+    # voxel_set_player_shape was here, removed as unused
+    # Sort the shape definition once (drawing order will be dynamic based on player_pos_world)
+    player_voxels_shape.sort(key=lambda v: (v[2], v[1], v[0]))
     # Sort the shape definition once (drawing order will be dynamic based on player_pos_world)
     player_voxels_shape.sort(key=lambda v: (v[2], v[1], v[0]))
 
@@ -201,11 +248,32 @@ def main():
     running = True
     while running:
         dt = clock.get_time() / 1000.0  # Delta time in seconds
+        current_fps = clock.get_fps() # Get current FPS
 
         # --- Event Handling ---
         for event in pygame.event.get():
             if event.type == pygame.QUIT: 
                 running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_h:
+                    show_help = not show_help
+                elif event.key == pygame.K_p:
+                    paused = not paused
+                if event.key == pygame.K_SPACE:
+                    # On press, if on ground and not already charging a jump, begin a jump.
+                    if is_on_ground and not is_charging_jump:
+                        player_vel[2] = INITIAL_JUMP_VELOCITY_UPS # Apply initial jump velocity
+                        is_charging_jump = True
+                        jump_charge_start_time = pygame.time.get_ticks() / 1000.0
+                        target_squish = SQUISH_ON_JUMP_START   # Target squish on jump start
+                        is_on_ground = False                   # No longer on ground
+                elif event.key == pygame.K_j: light_direction[0] = max(-1, light_direction[0] - 0.1)
+                elif event.key == pygame.K_l: light_direction[0] = min(1, light_direction[0] + 0.1)
+                elif event.key == pygame.K_i: light_direction[1] = max(-1, light_direction[1] - 0.1)
+                elif event.key == pygame.K_k: light_direction[1] = min(1, light_direction[1] + 0.1)
+                elif event.key == pygame.K_u: light_direction[2] = max(-1, light_direction[2] - 0.1)
+                elif event.key == pygame.K_o: light_direction[2] = min(1, light_direction[2] + 0.1)
+                light_direction = normalize_vector(light_direction) # Keep it normalized
             elif event.type == pygame.MOUSEBUTTONDOWN:
                 if event.button == 1:
                     # If click occurs in toolbar area, check for light icon click
@@ -235,28 +303,24 @@ def main():
                 if event.button == 1: 
                     dragging_left = False
             elif event.type == pygame.MOUSEWHEEL:
-                zoom += event.y * 0.1; zoom = max(0.1, zoom)
+                zoom += event.y * 0.1
+                zoom = max(0.3, min(2.5, zoom))  # Clamp zoom to reasonable range
             elif event.type == pygame.KEYUP:
                 if event.key == pygame.K_SPACE:
                     if is_charging_jump: # If a jump was being charged/boosted
                         is_charging_jump = False
                         # jump_charge_start_time will remain until max duration or landing
-            elif event.type == pygame.KEYDOWN:
-                if event.key == pygame.K_SPACE:
-                    # On press, if on ground and not already charging a jump, begin a jump.
-                    if is_on_ground and not is_charging_jump:
-                        player_vel[2] = INITIAL_JUMP_VELOCITY_UPS # Apply initial jump velocity
-                        is_charging_jump = True
-                        jump_charge_start_time = pygame.time.get_ticks() / 1000.0
-                        target_squish = SQUISH_ON_JUMP_START   # Target squish on jump start
-                        is_on_ground = False                   # No longer on ground
-                elif event.key == pygame.K_j: light_direction[0] = max(-1, light_direction[0] - 0.1)
-                elif event.key == pygame.K_l: light_direction[0] = min(1, light_direction[0] + 0.1)
-                elif event.key == pygame.K_i: light_direction[1] = max(-1, light_direction[1] - 0.1)
-                elif event.key == pygame.K_k: light_direction[1] = min(1, light_direction[1] + 0.1)
-                elif event.key == pygame.K_u: light_direction[2] = max(-1, light_direction[2] - 0.1)
-                elif event.key == pygame.K_o: light_direction[2] = min(1, light_direction[2] + 0.1)
-                light_direction = normalize_vector(light_direction) # Keep it normalized
+
+        if paused:
+            # Draw pause overlay and skip updates
+            screen.fill((30, 30, 30))
+            pause_text = font_big.render("Paused", True, (255, 255, 255))
+            screen.blit(pause_text, (SCREEN_WIDTH//2 - pause_text.get_width()//2, SCREEN_HEIGHT//2 - 40))
+            hint_text = font.render("Press P to resume", True, (200, 200, 200))
+            screen.blit(hint_text, (SCREEN_WIDTH//2 - hint_text.get_width()//2, SCREEN_HEIGHT//2 + 10))
+            pygame.display.flip()
+            clock.tick(60)
+            continue
 
         if dragging_left:
             mpos = pygame.mouse.get_pos()
@@ -269,37 +333,40 @@ def main():
 
         keys = pygame.key.get_pressed()
 
-        # --- Movement Physics - XY Plane ---
-        # Determine acceleration rate and max speed based on shift key
+        # --- Movement Physics - XY Plane using Forces (Adjusted Speed) ---
         current_accel_rate = FAST_ACCEL_RATE if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else BASE_ACCEL_RATE
         current_max_speed_ups = FAST_MAX_SPEED_UPS if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else BASE_MAX_SPEED_UPS
-
-        accel_rate_x, accel_rate_y = 0.0, 0.0
-        if keys[pygame.K_a]: accel_rate_x = -current_accel_rate
-        if keys[pygame.K_d]: accel_rate_x =  current_accel_rate
-        if keys[pygame.K_w]: accel_rate_y = -current_accel_rate
-        if keys[pygame.K_s]: accel_rate_y =  current_accel_rate
-
-        # Apply accelerations with greater control on ground
+        input_force_x, input_force_y = 0.0, 0.0
+        if keys[pygame.K_a]:
+            input_force_x = -current_accel_rate
+        if keys[pygame.K_d]:
+            input_force_x =  current_accel_rate
+        if keys[pygame.K_w]:
+            input_force_y = -current_accel_rate
+        if keys[pygame.K_s]:
+            input_force_y =  current_accel_rate
         ground_control_multiplier = 1.2 if is_on_ground else 1.0
-        player_vel[0] += accel_rate_x * dt * ground_control_multiplier
-        player_vel[1] += accel_rate_y * dt * ground_control_multiplier
+        input_force_x *= ground_control_multiplier
+        input_force_y *= ground_control_multiplier
 
-        # Apply damping with stronger effect on ground
-        ground_damping_multiplier = 1.5 if is_on_ground else 1.0
-        if accel_rate_x == 0: player_vel[0] *= (1 - DAMPING_FACTOR * dt * ground_damping_multiplier)
-        if accel_rate_y == 0: player_vel[1] *= (1 - DAMPING_FACTOR * dt * ground_damping_multiplier)
-        
-        # Clamp to max speed for XY plane
+        # Use a reduced friction factor for smoothing without over-damping:
+        local_friction = 0.015   # decreased from 0.025 to reduce undue slowing
+        friction_force_x = local_friction * player_vel[0]
+        friction_force_y = local_friction * player_vel[1]
+
+        total_force_x = input_force_x - friction_force_x
+        total_force_y = input_force_y - friction_force_y
+
+        # Update velocity using F = ma:
+        player_vel[0] += (total_force_x / MASS) * dt
+        player_vel[1] += (total_force_y / MASS) * dt
+
+        # Clamp XY speed to max value:
         current_speed_xy = math.hypot(player_vel[0], player_vel[1])
         if current_speed_xy > current_max_speed_ups:
             scale = current_max_speed_ups / current_speed_xy
             player_vel[0] *= scale
             player_vel[1] *= scale
-
-        # Stop if very slow to prevent drifting
-        if abs(player_vel[0]) < 0.01: player_vel[0] = 0
-        if abs(player_vel[1]) < 0.01: player_vel[1] = 0
 
         # --- Jump and Vertical Physics ---
         current_time = pygame.time.get_ticks() / 1000.0
@@ -335,7 +402,7 @@ def main():
             
             # Handle landing
             if not is_on_ground:
-                impact_velocity = prev_pos[2] - player_pos_world[2]
+                # impact_velocity was here, removed as unused
                 if abs(player_vel[2]) > BOUNCE_THRESHOLD:
                     # Significant landing - apply bounce and squish
                     player_vel[2] = BOUNCE_ON_LAND_VELOCITY_UPS
@@ -367,29 +434,26 @@ def main():
             if abs(player_vel[2]) < 0.1:
                 player_vel[2] = 0  # Avoid tiny bounces
         
-        # --- Update Squish with Damped Spring Physics ---
-        # Use a damped spring model for squish animation to avoid oscillation
-        
-        # Calculate spring force
-        spring_force = (target_squish - squish) * elasticity
-        
-        # Apply damping to the squish velocity
-        squish_velocity = squish_velocity * (1.0 - SQUISH_DAMPING * dt) + spring_force * dt
-        
-        # Update squish value
-        squish += squish_velocity
-        
-        # Gradually return target squish to 1.0 (normal shape)
-        if is_on_ground and not is_charging_jump:
-            target_squish += (1.0 - target_squish) * 2.0 * dt
-        
-        # Clamp squish value to reasonable range and snap if close to 1.0
-        squish = max(0.3, min(1.2, squish))
-        if abs(squish - 1.0) < 0.02 and abs(squish_velocity) < 0.1:
-            squish = 1.0
-            squish_velocity = 0.0
+        # --- Update Squish with Improved Deformation Model ---
+        if is_on_ground:
+            # Use damped spring model only when on the ground (landing or push-off)
+            spring_force = (target_squish - squish) * elasticity
+            squish_velocity = squish_velocity * (1.0 - SQUISH_DAMPING * dt) + spring_force * dt
+            squish += squish_velocity
+            # When not actively jumping, set target to normal instantly
             if not is_charging_jump:
                 target_squish = 1.0
+        else:
+            # When airborne, quickly restore shape (avoid extra oscillation)
+            squish = squish + (1.0 - squish) * 0.2 * dt
+            squish_velocity = 0.0
+
+        # Clamp and snap to normal when nearly restored
+        squish = max(0.3, min(1.2, squish))
+        if abs(squish - 1.0) < 0.02:
+            squish = 1.0
+            squish_velocity = 0.0
+            target_squish = 1.0
 
         # --- Update True 3D Rolling Rotation via Quaternion ---
         new_player_xy = (player_pos_world[0], player_pos_world[1])
@@ -421,22 +485,16 @@ def main():
         draw_origin_x = origin_x_base + camera_offset_x
         draw_origin_y = origin_y_base + camera_offset_y
 
-        # Combine all drawable items (ground and player voxels) and sort by Z for painter's
-        # This is a simplified approach; for complex scenes, more granular sorting is needed.
-        # For now, we draw ground first, then player, relying on player's Z being generally higher.
-        
-        # Draw Ground (only top faces)
-        for gx, gy, gz in ground_voxels_coords:
-            face_key = "iso_top"
-            face_indices = get_voxel_face_points_from_indices(gx, gy, gz, face_key)
-            if face_indices:
-                face_normal = FACE_NORMALS[face_key]
-                shaded_g_color = compute_face_color_with_normal(BROWN, face_normal, light_dir_normalized)
-                # Project the 3D indices of the face corners
-                raw_proj_pts = [project_iso(p[0], p[1], p[2], zoom) for p in face_indices]
-                # Shift by camera origin
-                shifted = [(p[0] + draw_origin_x, p[1] + draw_origin_y) for p in raw_proj_pts]
-                pygame.draw.polygon(game_surface, shaded_g_color, shifted)
+        # --- Draw Ground and Grid using Cached Surface ---
+        # Re-render cached ground surface only if zoom or camera offset have changed significantly.
+        if (cached_ground_surface is None or zoom != cached_ground_zoom or  # Use global zoom
+            abs(camera_offset_x - (cached_camera_offset[0] or 0)) > 10 or 
+            abs(camera_offset_y - (cached_camera_offset[1] or 0)) > 10):
+            cached_ground_surface = render_ground_surface(draw_origin_x, draw_origin_y, zoom, ground_level_z) # Pass global zoom and ground_level_z
+            cached_ground_zoom = zoom # Use global zoom
+            cached_camera_offset = (camera_offset_x, camera_offset_y)
+        # Blit the cached ground surface to game_surface at proper offset.
+        game_surface.blit(cached_ground_surface, (0, 0))
 
         # Draw Player Shadow
         shadow_world_z_on_ground = ground_level_z + 1 # Top surface of ground
@@ -461,9 +519,9 @@ def main():
             shadow_world_x = player_pos_world[0]
             shadow_world_y = player_pos_world[1]
 
-        shadow_proj = project_iso(shadow_world_x, shadow_world_y, shadow_world_z_on_ground, zoom)
-        shadow_screen_x = shadow_proj[0] + draw_origin_x
-        shadow_screen_y = shadow_proj[1] + draw_origin_y
+        shadow_proj_x, shadow_proj_y = project_iso(shadow_world_x, shadow_world_y, shadow_world_z_on_ground, zoom)
+        shadow_screen_x = int(shadow_proj_x + draw_origin_x)
+        shadow_screen_y = int(shadow_proj_y + draw_origin_y)
         height_above_shadow_plane = max(0, (player_pos_world[2] - radius) - shadow_world_z_on_ground)
         shadow_alpha = max(0, 120 - height_above_shadow_plane * 8) # Adjusted alpha fade
         shadow_size_factor = max(0.1, 1 - height_above_shadow_plane * 0.05) # Adjusted size fade
@@ -476,65 +534,98 @@ def main():
             game_surface.blit(shadow_surf, (shadow_screen_x - shadow_base_width // 2, shadow_screen_y - shadow_base_height // 2))
 
         # Draw Player Sphere (voxels relative to player_pos_world)
-        # We need to sort player voxels by their absolute Z for correct intra-sphere drawing
-        # This is a bit inefficient to do every frame, but necessary for rotation later
-        # For now, player_voxels_shape is already sorted by relative Z.
-        # When combined with player_pos_world[2], the order should largely hold for drawing.
-
         temp_player_draw_list = []
         for rel_ix, rel_iy, rel_iz_shape, base_color in player_voxels_shape:
-            # Compute rotated coordinate using quaternion
             rotated = quat_rotate_point(player_rotation, (rel_ix, rel_iy, rel_iz_shape))
-            # Apply squish: horizontal scaled by 1/squish; vertical (z) scaled by squish.
             scaled = (rotated[0] * (1.0/squish), rotated[1] * (1.0/squish), rotated[2] * squish)
             abs_ix = scaled[0] + player_pos_world[0]
             abs_iy = scaled[1] + player_pos_world[1]
             abs_iz = scaled[2] + player_pos_world[2]
-            temp_player_draw_list.append((abs_ix, abs_iy, abs_iz, base_color, (rel_ix, rel_iy, rel_iz_shape)))
+            temp_player_draw_list.append({'abs_pos': (abs_ix, abs_iy, abs_iz), 'color': base_color, 'rel_coords': (rel_ix, rel_iy, rel_iz_shape)})
 
-        # Sort by absolute Z for drawing this frame
-        temp_player_draw_list.sort(key=lambda v: v[2])
+        temp_player_draw_list.sort(key=lambda v: v['abs_pos'][2])
 
-        for abs_ix, abs_iy, abs_iz, base_color, rel_coords in temp_player_draw_list:
-            # Instead of culling based on unrotated shape, draw all faces for a solid sphere.
-            for face_key in FACE_NORMALS.keys():
-                # Adjust for get_voxel_face_points_from_indices expecting bottom-left-back corner
-                voxel_corner_x, voxel_corner_y, voxel_corner_z = abs_ix - 0.5, abs_iy - 0.5, abs_iz - 0.5
-                face_indices = get_voxel_face_points_from_indices(voxel_corner_x, voxel_corner_y, voxel_corner_z, face_key)
-                if face_indices:
-                    base_normal = FACE_NORMALS[face_key]
-                    # Rotate the base face normal using the same quaternion:
-                    rotated_normal = quat_rotate_point(player_rotation, base_normal)
-                    shaded_color = compute_face_color_with_normal(base_color, rotated_normal, light_dir_normalized)
-                    raw_proj_pts = [project_iso(p[0], p[1], p[2], zoom) for p in face_indices]
-                    shifted = [(p[0] + draw_origin_x, p[1] + draw_origin_y) for p in raw_proj_pts]
-                    pygame.draw.polygon(game_surface, shaded_color, shifted)
+        faces_drawn_count = 0 # For debugging culling effectiveness
+
+        for voxel_data in temp_player_draw_list:
+            abs_ix, abs_iy, abs_iz = voxel_data['abs_pos']
+            base_color = voxel_data['color']
+            
+            # Voxel's bottom-left-back corner in world space for face point calculation
+            voxel_blb_x, voxel_blb_y, voxel_blb_z = abs_ix - 0.5, abs_iy - 0.5, abs_iz - 0.5
+
+            for face_key, base_normal in FACE_NORMALS.items():
+                rotated_normal = quat_rotate_point(player_rotation, base_normal)
+                
+                # --- Back-face Culling ---
+                dot_product_view = (rotated_normal[0] * VIEW_DIRECTION_FOR_CULLING[0] +
+                                    rotated_normal[1] * VIEW_DIRECTION_FOR_CULLING[1] +
+                                    rotated_normal[2] * VIEW_DIRECTION_FOR_CULLING[2])
+                if dot_product_view <= CULLING_THRESHOLD: # If normal is pointing away from camera or too parallel
+                    continue 
+                
+                faces_drawn_count +=1
+                face_indices = get_voxel_face_points_from_indices(voxel_blb_x, voxel_blb_y, voxel_blb_z, face_key)
+                # No need to check 'if face_indices:' as get_voxel_face_points_from_indices always returns points now
+
+                shaded_color = compute_face_color_with_normal(base_color, rotated_normal, light_dir_normalized)
+                raw_proj_pts = [project_iso(p[0], p[1], p[2], zoom) for p in face_indices]
+                shifted = [(int(p[0] + draw_origin_x), int(p[1] + draw_origin_y)) for p in raw_proj_pts]
+                pygame.draw.polygon(game_surface, shaded_color, shifted)
 
         # --- Draw Toolbar as Clickable UI ---
         toolbar_surface.fill(TOOLBAR_COLOR)
         # Draw light icon (a simple circle) at right side:
         light_icon_rect = pygame.Rect(SCREEN_WIDTH - 50, 5, 40, 30)
+        mouse_pos = pygame.mouse.get_pos()
+        mouse_over_icon = light_icon_rect.collidepoint(mouse_pos)
         pygame.draw.ellipse(toolbar_surface, WHITE, light_icon_rect, 2)
-        if light_mode:
-            pygame.draw.ellipse(toolbar_surface, (255, 255, 0), light_icon_rect)
-        
+        if light_mode or mouse_over_icon:
+            pygame.draw.ellipse(toolbar_surface, (255, 255, 0) if light_mode else (180, 180, 0), light_icon_rect, 0)
+
         # Draw state information for debugging
         lt = f"Light: X{light_direction[0]:.1f} Y{light_direction[1]:.1f} Z{light_direction[2]:.1f}"
         t_s = font.render(lt, True, TEXT_COLOR)
         toolbar_surface.blit(t_s, (5, 5))
-        
-        zt = f"Zoom: {zoom:.1f}x"
+
+        fps_text = f"FPS: {current_fps:.0f}" # Display FPS
+        fps_s = font.render(fps_text, True, TEXT_COLOR)
+        toolbar_surface.blit(fps_s, (SCREEN_WIDTH - 280, 5)) # Adjusted position for FPS
+
+        zt = f"Zoom: {zoom:.2f}x"
         z_s = font.render(zt, True, TEXT_COLOR)
         toolbar_surface.blit(z_s, (SCREEN_WIDTH - 200, 5))
-        
+
         state_color = (120, 255, 120) if is_on_ground else TEXT_COLOR
         pt = f"Pos: X{player_pos_world[0]:.1f} Y{player_pos_world[1]:.1f} Z{player_pos_world[2]:.1f}"
         p_s = font.render(pt, True, state_color)
         toolbar_surface.blit(p_s, (5, 20))
-        
-        st = f"Vel: {current_speed_xy:.1f} Squish: {squish:.2f}"
+
+        st = f"Speed: {current_speed_xy:.1f}  Jump: {'CHARGE' if is_charging_jump else ('ON GROUND' if is_on_ground else 'AIR')}  Squish: {squish:.2f}" # Faces: {faces_drawn_count}"
         s_s = font.render(st, True, TEXT_COLOR)
-        toolbar_surface.blit(s_s, (SCREEN_WIDTH - 200, 20))
+        toolbar_surface.blit(s_s, (SCREEN_WIDTH - 450, 20)) # Adjusted position
+
+        # --- Draw help overlay if toggled ---
+        if show_help:
+            help_lines = [
+                "Controls:",
+                "WASD: Roll/Move",
+                "Space: Jump / Hold for higher jump",
+                "Shift: Sprint",
+                "Mouse Drag: Pan Camera",
+                "Mouse Wheel: Zoom",
+                "Click Lightbulb: Set Light Source",
+                "H: Toggle Help   P: Pause",
+                "",
+                "Tip: The ball rolls with momentum. Use gentle steering for curves!"
+            ]
+            help_bg = pygame.Surface((400, 220))
+            help_bg.set_alpha(220)
+            help_bg.fill((30, 30, 30))
+            screen.blit(help_bg, (SCREEN_WIDTH//2 - 200, 80))
+            for i, line in enumerate(help_lines):
+                txt = font.render(line, True, (255, 255, 180) if i == 0 else (220, 220, 220))
+                screen.blit(txt, (SCREEN_WIDTH//2 - 190, 90 + i*24))
 
         screen.blit(toolbar_surface, (0, 0))
         screen.blit(game_surface, (0, TOOLBAR_HEIGHT))
