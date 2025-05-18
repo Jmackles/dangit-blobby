@@ -1,1092 +1,647 @@
 import pygame
 import math
 import game_config as cfg
+import time
+import sys
+import json
 
-# --- Constants ---
-# Load initial screen dimensions from config (these keys already exist)
+pygame.font.init() # Initialize font module
+
+# --- Constants and Config Loading ---
 SCREEN_WIDTH = cfg.get("SCREEN_WIDTH")
 SCREEN_HEIGHT = cfg.get("SCREEN_HEIGHT")
-# Load UI constants from config
-TOOLBAR_HEIGHT = cfg.get("UI_TOOLBAR_HEIGHT") 
+TOOLBAR_HEIGHT = cfg.get("UI_TOOLBAR_HEIGHT")
 GAME_SCREEN_HEIGHT = SCREEN_HEIGHT - TOOLBAR_HEIGHT
-# Add PLAYER_SCALE global
-PLAYER_SCALE = cfg.get("PLAYER_SCALE")
-BASE_RADIUS = 6  # Base player radius
+BASE_RADIUS = 6 # Base radius for player shape definition
 
-BLACK = (0, 0, 0)
-WHITE = (255, 255, 255)
-GREEN_BASE = (34, 139, 34)
-BROWN = (139, 69, 19)
-TOOLBAR_COLOR = (50, 50, 50)
-TEXT_COLOR = (200, 200, 200)
+# Colors
+BLACK, WHITE, GREEN_BASE, BROWN = (0,0,0), (255,255,255), (34,139,34), (139,69,19)
+TOOLBAR_COLOR, TEXT_COLOR = (50,50,50), (200,200,200)
 
-# Load constants from config
+# Iso & Voxel settings from config
 VOXEL_SIZE = cfg.get("VOXEL_SIZE")
-ISO_TILE_WIDTH_HALF_BASE = VOXEL_SIZE * 0.866 # Base for zoom
-ISO_TILE_HEIGHT_HALF_BASE = VOXEL_SIZE * 0.5   # Base for zoom
-ISO_Z_FACTOR_BASE = VOXEL_SIZE                # Base for zoom
-
+ISO_TILE_WIDTH_HALF_BASE = VOXEL_SIZE * 0.866
+ISO_TILE_HEIGHT_HALF_BASE = VOXEL_SIZE * 0.5
+ISO_Z_FACTOR_BASE = VOXEL_SIZE
 GROUND_RANGE = cfg.get("GROUND_RANGE")
+GROUND_CACHE_MARGIN = cfg.get("UI_GROUND_CACHE_MARGIN")
 
-# --- Global Variables ---
+# --- Global Game State Variables ---
 zoom = 1.0
-light_direction = [-0.577, -0.577, 0.577] # Normalized default: up-left-ish
+light_direction = [-0.577, -0.577, 0.577] # Default light
+player_rotation = (1.0, 0.0, 0.0, 0.0)   # Quaternion (w, x, y, z)
+light_mode = False
 
-# --- Helper Functions (moved earlier for use in global constants) ---
-def normalize_vector(v):
-    mag = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
-    if mag == 0:
-        return (0, 0, 0) # Or raise an error, or return v
-    return (v[0]/mag, v[1]/mag, v[2]/mag)
+# Physics state variables
+is_charging_jump = False
+jump_charge_start_time = None
+squish = 1.0
+is_on_ground = False
+target_squish = 1.0
+squish_velocity = 0.0
 
-# --- Optimization: Pre-calculated relative corner offsets for voxel faces ---
-# Relative to the voxel's origin (ix, iy, iz), assuming s=1
-VOXEL_CORNER_OFFSETS = {
-    "iso_top":    [(0,0,1), (0,1,1), (1,1,1), (1,0,1)],
-    "iso_bottom": [(1,0,0), (1,1,0), (0,1,0), (0,0,0)], # Reversed for CCW from bottom
-    "iso_left_side": [(0,0,0), (0,1,0), (0,1,1), (0,0,1)],
-    "iso_right_side":[(1,0,1), (1,1,1), (1,1,0), (1,0,0)],
-    "iso_front_side":[(0,1,1), (0,1,0), (1,1,0), (1,1,1)], # Assuming +Y is front
-    "iso_back_side": [(0,0,1), (1,0,1), (1,0,0), (0,0,0)],  # Assuming -Y is back
-}
+# --- Physics Parameters (will be loaded from cfg) ---
+# Declare all to be loaded to avoid NameErrors if accessed before main() fully runs load_physics_params
+PLAYER_SCALE_cfg = 1.0 # Note: _cfg suffix to distinguish from any potential local 'PLAYER_SCALE'
+CULLING_THRESHOLD_cfg = 0.05
+BASE_ACCEL_RATE, FAST_ACCEL_RATE, BASE_MAX_SPEED_UPS, FAST_MAX_SPEED_UPS = 0,0,0,0
+DAMPING_FACTOR, MASS, GRAVITY_ACCEL, COEFFICIENT_OF_RESTITUTION = 0,0,0,0
+INITIAL_JUMP_VELOCITY_UPS, JUMP_CHARGE_BOOST_ACCEL_RATE, MAX_JUMP_CHARGE_DURATION = 0,0,0
+BOUNCE_ON_LAND_VELOCITY_UPS, BOUNCE_THRESHOLD, GROUND_CONTACT_THRESHOLD = 0,0,0
+REST_VELOCITY_THRESHOLD, elasticity, SQUISH_ON_JUMP_START, SQUISH_ON_LANDING = 0,0,0,0
+MAX_SQUISH_FROM_CHARGE, SQUISH_DAMPING, IMPACT_VELOCITY_THRESHOLD = 0,0,0
+MAX_IMPACT_VELOCITY, MIN_SQUISH_ON_LANDING, MAX_SQUISH_ON_LANDING = 0,0,0
+BOUNCE_SOUND_THRESHOLD, STICTION_THRESHOLD, EXTRA_FRICTION, BASE_SPEED_MULTIPLIER = 0,0,0,0
 
-# --- Optimization: View direction for back-face culling ---
-# Approximates the direction the camera is looking from, towards the origin.
-# Used to determine if a face normal is pointing towards the camera.
-VIEW_DIRECTION_FOR_CULLING = normalize_vector((1, 1, 0.8)) # Tuned for typical isometric view
-CULLING_THRESHOLD = cfg.get("CULLING_THRESHOLD") # Small positive threshold to avoid z-fighting or shimmering at edges
+def load_physics_params_from_config():
+    """Loads all physics parameters from the cfg module into their respective global variables."""
+    global PLAYER_SCALE_cfg, CULLING_THRESHOLD_cfg, \
+           BASE_ACCEL_RATE, FAST_ACCEL_RATE, BASE_MAX_SPEED_UPS, FAST_MAX_SPEED_UPS, \
+           DAMPING_FACTOR, MASS, GRAVITY_ACCEL, COEFFICIENT_OF_RESTITUTION, \
+           INITIAL_JUMP_VELOCITY_UPS, JUMP_CHARGE_BOOST_ACCEL_RATE, MAX_JUMP_CHARGE_DURATION, \
+           BOUNCE_ON_LAND_VELOCITY_UPS, BOUNCE_THRESHOLD, GROUND_CONTACT_THRESHOLD, \
+           REST_VELOCITY_THRESHOLD, elasticity, SQUISH_ON_JUMP_START, SQUISH_ON_LANDING, \
+           MAX_SQUISH_FROM_CHARGE, SQUISH_DAMPING, IMPACT_VELOCITY_THRESHOLD, \
+           MAX_IMPACT_VELOCITY, MIN_SQUISH_ON_LANDING, MAX_SQUISH_ON_LANDING, \
+           BOUNCE_SOUND_THRESHOLD, STICTION_THRESHOLD, EXTRA_FRICTION, BASE_SPEED_MULTIPLIER
 
-# Face normals (world space - assuming standard voxel orientation)
-FACE_NORMALS = {
-    "iso_top": (0, 0, 1),
-    "iso_bottom": (0, 0, -1),
-    "iso_left_side": (-1, 0, 0),
-    "iso_right_side": (1, 0, 0),
-    "iso_front_side": (0, 1, 0), # Assuming +Y is "front" or "away"
-    "iso_back_side": (0, -1, 0),  # Assuming -Y is "back" or "towards camera"
-}
-
-# --- New Global Variables for True 3D Rotation & Physics ---
-player_rotation = (1.0, 0.0, 0.0, 0.0)  # Quaternion (w, x, y, z) for full rotation (identity)
-
-# --- New Global Variables for Light Placement & Rolling ---
-light_mode = False         # When True, next click in game sets light source
-light_source_pos = None    # World XY position for the light
-
-# --- Updated Physics Constants (frame-rate independent) ---
-# Load from config
-BASE_ACCEL_RATE = cfg.get("BASE_ACCEL_RATE")
-FAST_ACCEL_RATE = cfg.get("FAST_ACCEL_RATE")
-BASE_MAX_SPEED_UPS = cfg.get("BASE_MAX_SPEED_UPS")
-FAST_MAX_SPEED_UPS = cfg.get("FAST_MAX_SPEED_UPS")
-DAMPING_FACTOR = cfg.get("DAMPING_FACTOR")
-MASS = cfg.get("MASS")
-GRAVITY_ACCEL = cfg.get("GRAVITY_ACCEL")
-COEFFICIENT_OF_RESTITUTION = cfg.get("COEFFICIENT_OF_RESTITUTION")
-
-INITIAL_JUMP_VELOCITY_UPS = cfg.get("INITIAL_JUMP_VELOCITY_UPS")
-JUMP_CHARGE_BOOST_ACCEL_RATE = cfg.get("JUMP_CHARGE_BOOST_ACCEL_RATE")
-MAX_JUMP_CHARGE_DURATION = cfg.get("MAX_JUMP_CHARGE_DURATION")
-BOUNCE_ON_LAND_VELOCITY_UPS = cfg.get("BOUNCE_ON_LAND_VELOCITY_UPS")
-BOUNCE_THRESHOLD = cfg.get("BOUNCE_THRESHOLD")
-
-# --- Ground Contact Detection ---
-GROUND_CONTACT_THRESHOLD = cfg.get("GROUND_CONTACT_THRESHOLD")
-REST_VELOCITY_THRESHOLD = cfg.get("REST_VELOCITY_THRESHOLD")
-
-# --- Updated Jump and Elasticity Variables ---
-elasticity = cfg.get("elasticity")
-SQUISH_ON_JUMP_START = cfg.get("SQUISH_ON_JUMP_START")
-SQUISH_ON_LANDING = cfg.get("SQUISH_ON_LANDING")
-MAX_SQUISH_FROM_CHARGE = cfg.get("MAX_SQUISH_FROM_CHARGE")
-SQUISH_DAMPING = cfg.get("SQUISH_DAMPING")
-
-# --- Impact Physics ---
-IMPACT_VELOCITY_THRESHOLD = cfg.get("IMPACT_VELOCITY_THRESHOLD")
-MAX_IMPACT_VELOCITY = cfg.get("MAX_IMPACT_VELOCITY")
-MIN_SQUISH_ON_LANDING = cfg.get("MIN_SQUISH_ON_LANDING")
-MAX_SQUISH_ON_LANDING = cfg.get("MAX_SQUISH_ON_LANDING")
-BOUNCE_SOUND_THRESHOLD = cfg.get("BOUNCE_SOUND_THRESHOLD")
-
-# Player state for jumping
-is_charging_jump = False    # True while space is held after initial jump, for boost
-jump_charge_start_time = None # Time when jump key was pressed
-squish = 1.0                # 1.0 = normal shape; lower values mean squished
-is_on_ground = False        # Track ground contact state
-target_squish = 1.0         # Target squish value (for damping)
-squish_velocity = 0.0       # Rate of change of squish (for damping)
-
-# --- Physics Tuning Panel ---
-show_physics_panel = False
-PHYSICS_PANEL_WIDTH = cfg.get("UI_PHYSICS_PANEL_WIDTH") # Load from config
-PHYSICS_PANEL_COLOR = (40, 40, 60, 230) # Added alpha for slight transparency
-PHYSICS_PANEL_TEXT_COLOR = (220, 220, 220)
-PHYSICS_SLIDER_TRACK_COLOR = (70, 70, 90)
-PHYSICS_SLIDER_HANDLE_COLOR = (150, 150, 180)
-PHYSICS_TEXT_INPUT_BG_COLOR = (20, 20, 30)
-PHYSICS_TEXT_INPUT_BORDER_COLOR = (180, 180, 180)
-
-active_text_input_param_key = None # Stores var_name of parameter being edited
-text_input_string = ""
-dragging_slider_param_key = None # Stores var_name of slider being dragged
-
-# --- Draggable Physics Panel State ---
-physics_panel_pos = [50, 50] # Initial position, can be adjusted
-dragging_physics_panel = False
-physics_panel_drag_start_offset = (0, 0)
-PHYSICS_PANEL_TITLE_BAR_HEIGHT = 30
-PHYSICS_PANEL_TITLE_COLOR = (60, 60, 80, 230)
-PHYSICS_PANEL_BORDER_COLOR = (100, 100, 120)
-
-# Define parameters to be tuned
-# Each dict: {label, var_name, min_val, max_val, format_str}
-# _value_rect, _slider_track_rect, _slider_handle_rect will be added dynamically
-physics_params_config = [
-    {"label": "Base Accel", "var_name": "BASE_ACCEL_RATE", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
-    {"label": "Fast Accel", "var_name": "FAST_ACCEL_RATE", "min_val": 1.0, "max_val": 150.0, "format_str": "{:.1f}"},
-    {"label": "Base Max Speed", "var_name": "BASE_MAX_SPEED_UPS", "min_val": 5.0, "max_val": 200.0, "format_str": "{:.1f}"},
-    {"label": "Fast Max Speed", "var_name": "FAST_MAX_SPEED_UPS", "min_val": 10.0, "max_val": 300.0, "format_str": "{:.1f}"},
-    {"label": "Damping Factor", "var_name": "DAMPING_FACTOR", "min_val": 0.1, "max_val": 30.0, "format_str": "{:.1f}"},
-    {"label": "Mass", "var_name": "MASS", "min_val": 0.1, "max_val": 50.0, "format_str": "{:.1f}"},
-    {"label": "Gravity Accel", "var_name": "GRAVITY_ACCEL", "min_val": -1000.0, "max_val": -1.0, "format_str": "{:.1f}"},
-    {"label": "Restitution Coeff", "var_name": "COEFFICIENT_OF_RESTITUTION", "min_val": 0.0, "max_val": 1.0, "format_str": "{:.2f}"},
-    {"label": "Initial Jump Vel", "var_name": "INITIAL_JUMP_VELOCITY_UPS", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
-    {"label": "Jump Boost Accel", "var_name": "JUMP_CHARGE_BOOST_ACCEL_RATE", "min_val": 1.0, "max_val": 200.0, "format_str": "{:.1f}"},
-    {"label": "Max Jump Charge (s)", "var_name": "MAX_JUMP_CHARGE_DURATION", "min_val": 0.1, "max_val": 5.0, "format_str": "{:.2f}"},
-    {"label": "Elasticity", "var_name": "elasticity", "min_val": 1.0, "max_val": 50.0, "format_str": "{:.1f}"},
-    {"label": "Squish Damping", "var_name": "SQUISH_DAMPING", "min_val": 1.0, "max_val": 50.0, "format_str": "{:.1f}"},
-    {"label": "Squish Jump Start", "var_name": "SQUISH_ON_JUMP_START", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"},
-    {"label": "Squish Landing", "var_name": "SQUISH_ON_LANDING", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"}, # This is a target, actual squish depends on impact
-    {"label": "Max Squish Charge", "var_name": "MAX_SQUISH_FROM_CHARGE", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"},
-    # Added new tunable parameters
-    {"label": "Stiction Threshold", "var_name": "STICTION_THRESHOLD", "min_val": 0.0, "max_val": 5.0, "format_str": "{:.2f}"},
-    {"label": "Extra Friction", "var_name": "EXTRA_FRICTION", "min_val": 0.0, "max_val": 0.99, "format_str": "{:.3f}"}, # Max < 1 to avoid multiplying by zero or negative
-    {"label": "Base Speed Multi", "var_name": "BASE_SPEED_MULTIPLIER", "min_val": 0.1, "max_val": 10.0, "format_str": "{:.2f}"},
-]
-
-# --- Quaternion Helper Functions ---
-def quat_from_axis_angle(axis, angle):
-    # axis: (x, y, z), angle in radians
-    ax, ay, az = axis
-    half_angle = angle / 2.0
-    sin_half = math.sin(half_angle)
-    return (math.cos(half_angle), ax*sin_half, ay*sin_half, az*sin_half)
-
-def quat_mult(q1, q2):
-    w1, x1, y1, z1 = q1
-    w2, x2, y2, z2 = q2
-    return (w1*w2 - x1*x2 - y1*y2 - z1*z2,
-            w1*x2 + x1*w2 + y1*z2 - z1*y2,
-            w1*y2 - x1*z2 + y1*w2 + z1*x2,
-            w1*z2 + x1*y2 - y1*x2 + z1*w2)
-
-def quat_conjugate(q):
-    w, x, y, z = q
-    return (w, -x, -y, -z)
-
-def quat_rotate_point(q, point):
-    # Rotate point using quaternion: p' = q * p * q_conjugate, where p is a pure quaternion (0, x, y, z)
-    p = (0.0, point[0], point[1], point[2])
-    qc = quat_conjugate(q)
-    p_rot = quat_mult(quat_mult(q, p), qc)
-    return (p_rot[1], p_rot[2], p_rot[3])
+    PLAYER_SCALE_cfg = cfg.get("PLAYER_SCALE")
+    CULLING_THRESHOLD_cfg = cfg.get("CULLING_THRESHOLD")
+    BASE_ACCEL_RATE = cfg.get("BASE_ACCEL_RATE")
+    FAST_ACCEL_RATE = cfg.get("FAST_ACCEL_RATE")
+    BASE_MAX_SPEED_UPS = cfg.get("BASE_MAX_SPEED_UPS")
+    FAST_MAX_SPEED_UPS = cfg.get("FAST_MAX_SPEED_UPS")
+    DAMPING_FACTOR = cfg.get("DAMPING_FACTOR")
+    MASS = cfg.get("MASS")
+    GRAVITY_ACCEL = cfg.get("GRAVITY_ACCEL")
+    COEFFICIENT_OF_RESTITUTION = cfg.get("COEFFICIENT_OF_RESTITUTION")
+    INITIAL_JUMP_VELOCITY_UPS = cfg.get("INITIAL_JUMP_VELOCITY_UPS")
+    JUMP_CHARGE_BOOST_ACCEL_RATE = cfg.get("JUMP_CHARGE_BOOST_ACCEL_RATE")
+    MAX_JUMP_CHARGE_DURATION = cfg.get("MAX_JUMP_CHARGE_DURATION")
+    BOUNCE_ON_LAND_VELOCITY_UPS = cfg.get("BOUNCE_ON_LAND_VELOCITY_UPS")
+    BOUNCE_THRESHOLD = cfg.get("BOUNCE_THRESHOLD")
+    GROUND_CONTACT_THRESHOLD = cfg.get("GROUND_CONTACT_THRESHOLD")
+    REST_VELOCITY_THRESHOLD = cfg.get("REST_VELOCITY_THRESHOLD")
+    elasticity = cfg.get("elasticity")
+    SQUISH_ON_JUMP_START = cfg.get("SQUISH_ON_JUMP_START")
+    SQUISH_ON_LANDING = cfg.get("SQUISH_ON_LANDING")
+    MAX_SQUISH_FROM_CHARGE = cfg.get("MAX_SQUISH_FROM_CHARGE")
+    SQUISH_DAMPING = cfg.get("SQUISH_DAMPING")
+    IMPACT_VELOCITY_THRESHOLD = cfg.get("IMPACT_VELOCITY_THRESHOLD")
+    MAX_IMPACT_VELOCITY = cfg.get("MAX_IMPACT_VELOCITY")
+    MIN_SQUISH_ON_LANDING = cfg.get("MIN_SQUISH_ON_LANDING")
+    MAX_SQUISH_ON_LANDING = cfg.get("MAX_SQUISH_ON_LANDING")
+    BOUNCE_SOUND_THRESHOLD = cfg.get("BOUNCE_SOUND_THRESHOLD")
+    STICTION_THRESHOLD = cfg.get("STICTION_THRESHOLD")
+    EXTRA_FRICTION = cfg.get("EXTRA_FRICTION")
+    BASE_SPEED_MULTIPLIER = cfg.get("BASE_SPEED_MULTIPLIER")
 
 # --- Helper Functions ---
-# def normalize_vector(v): # Moved to earlier in the script
-#     mag = math.sqrt(v[0]**2 + v[1]**2 + v[2]**2)
-#     if mag == 0:
-#         return (0, 0, 0) # Or raise an error, or return v
-#     return (v[0]/mag, v[1]/mag, v[2]/mag)
-
-def project_iso(ix, iy, iz, current_zoom):
-    """Converts 3D VOXEL INDICES (ix, iy, iz) to 2D isometric screen coordinates, applying zoom."""
-    # Scale projection factors by zoom
-    iso_tile_width_half = ISO_TILE_WIDTH_HALF_BASE * current_zoom
-    iso_tile_height_half = ISO_TILE_HEIGHT_HALF_BASE * current_zoom
-    iso_z_factor = ISO_Z_FACTOR_BASE * current_zoom
-    screen_x = (ix - iy) * iso_tile_width_half
-    screen_y = (ix + iy) * iso_tile_height_half - iz * iso_z_factor
-    # Return as floats for precision, convert to int just before drawing
-    return screen_x, screen_y
-
-def get_voxel_face_points_from_indices(ix, iy, iz, face_key):
-    """ Optimized: uses pre-calculated offsets. ix, iy, iz are the base coords (e.g., bottom-left-back corner)."""
-    offsets = VOXEL_CORNER_OFFSETS[face_key]
-    return [(ix + off[0], iy + off[1], iz + off[2]) for off in offsets]
-
-def compute_face_color_with_normal(base_color, face_normal_world, light_dir_normalized):
-    dot_product = (face_normal_world[0] * light_dir_normalized[0] +
-                   face_normal_world[1] * light_dir_normalized[1] +
-                   face_normal_world[2] * light_dir_normalized[2])
-    ambient = 0.45 # Slightly more ambient
-    diffuse_intensity = max(0, dot_product) # Light doesn't "pass through"
-    brightness = ambient + (1.0 - ambient) * diffuse_intensity
-    return (min(255, int(base_color[0] * brightness)),
-            min(255, int(base_color[1] * brightness)),
-            min(255, int(base_color[2] * brightness)))
-
-# Add these global caching variables at the top (after other globals)
-cached_ground_surface = None
-cached_ground_zoom = -1
-cached_camera_offset = (None, None)
-GROUND_CACHE_MARGIN = cfg.get("UI_GROUND_CACHE_MARGIN")  # Load from config
-
-def render_ground_surface(draw_origin_x, draw_origin_y, current_zoom, ground_level_z_val):
-    global cached_ground_surface, cached_ground_zoom, cached_camera_offset
-    surface_width = SCREEN_WIDTH + GROUND_CACHE_MARGIN # Use loaded GROUND_CACHE_MARGIN
-    surface_height = GAME_SCREEN_HEIGHT + GROUND_CACHE_MARGIN # Use loaded GROUND_CACHE_MARGIN
-    surf = pygame.Surface((surface_width, surface_height))
-    # Compute a large ground polygon so that no background is exposed.
-    R = int(GROUND_RANGE * 1.5)  # Extended range for full coverage
-    corners = [
-        (-R, -R, ground_level_z_val),
-        (R, -R, ground_level_z_val),
-        (R, R, ground_level_z_val),
-        (-R, R, ground_level_z_val)
-    ]
-    proj_corners = [project_iso(cx, cy, cz, current_zoom) for (cx, cy, cz) in corners]
-    shifted = [(int(pt[0] + draw_origin_x), int(pt[1] + draw_origin_y)) for pt in proj_corners]
+def normalize_vector(v): mag = math.sqrt(sum(c*c for c in v)); return tuple(c/mag for c in v) if mag else (0,0,0)
+VOXEL_CORNER_OFFSETS = { "iso_top": [(0,0,1),(0,1,1),(1,1,1),(1,0,1)], "iso_bottom": [(1,0,0),(1,1,0),(0,1,0),(0,0,0)], "iso_left_side": [(0,0,0),(0,1,0),(0,1,1),(0,0,1)], "iso_right_side": [(1,0,1),(1,1,1),(1,1,0),(1,0,0)], "iso_front_side": [(0,1,1),(0,1,0),(1,1,0),(1,1,1)], "iso_back_side": [(0,0,1),(1,0,1),(1,0,0),(0,0,0)]}
+VIEW_DIRECTION_FOR_CULLING = normalize_vector((1,1,0.8))
+FACE_NORMALS = {"iso_top":(0,0,1),"iso_bottom":(0,0,-1),"iso_left_side":(-1,0,0),"iso_right_side":(1,0,0),"iso_front_side":(0,1,0),"iso_back_side":(0,-1,0)}
+def project_iso(ix,iy,iz,current_zoom): iso_w,iso_h,iso_z = ISO_TILE_WIDTH_HALF_BASE*current_zoom, ISO_TILE_HEIGHT_HALF_BASE*current_zoom, ISO_Z_FACTOR_BASE*current_zoom; return (ix-iy)*iso_w, (ix+iy)*iso_h - iz*iso_z
+def get_voxel_face_points_from_indices(ix,iy,iz,face_key): offsets=VOXEL_CORNER_OFFSETS[face_key]; return [(ix+off[0],iy+off[1],iz+off[2]) for off in offsets]
+def compute_face_color_with_normal(base_color,face_normal_world,light_dir_normalized): dot=sum(fn*ld for fn,ld in zip(face_normal_world,light_dir_normalized)); amb=0.45;diff=max(0,dot);bright=amb+(1-amb)*diff; return tuple(min(255,int(c*bright)) for c in base_color)
+cached_ground_surface, cached_ground_zoom, cached_camera_offset = None, -1, (None,None)
+def render_ground_surface(current_zoom, ground_level_z_val): # Removed draw_origin args
+    surface_width = SCREEN_WIDTH + GROUND_CACHE_MARGIN
+    surface_height = GAME_SCREEN_HEIGHT + GROUND_CACHE_MARGIN
+    surf = pygame.Surface((surface_width, surface_height)); surf.fill(BLACK)
+    center_x_on_cache = surface_width // 2
+    center_y_on_cache = surface_height // 2
+    R = int(GROUND_RANGE * 1.5)
+    corners = [(-R,-R,ground_level_z_val),(R,-R,ground_level_z_val),(R,R,ground_level_z_val),(-R,R,ground_level_z_val)]
+    proj_corners = [project_iso(cx,cy,cz, current_zoom) for (cx,cy,cz) in corners]
+    shifted = [(int(pt[0] + center_x_on_cache), int(pt[1] + center_y_on_cache)) for pt in proj_corners]
     color = compute_face_color_with_normal(BROWN, FACE_NORMALS["iso_top"], light_direction)
     pygame.draw.polygon(surf, color, shifted)
     return surf
 
-# --- Physics Panel Drawing Function ---
-def draw_physics_panel(screen, font, panel_height):
-    global physics_params_config, active_text_input_param_key, text_input_string, physics_panel_pos
+# --- Quaternion Functions ---
+def quat_from_axis_angle(axis, angle): ax,ay,az=axis; half_angle=angle/2.0; s=math.sin(half_angle); return (math.cos(half_angle),ax*s,ay*s,az*s)
+def quat_mult(q1,q2): w1,x1,y1,z1=q1; w2,x2,y2,z2=q2; return (w1*w2-x1*x2-y1*y2-z1*z2, w1*x2+x1*w2+y1*z2-z1*y2, w1*y2-x1*z2+y1*w2+z1*x2, w1*z2+x1*y2-y1*x2+z1*w2)
+def quat_conjugate(q): w,x,y,z=q; return (w,-x,-y,-z)
+def quat_rotate_point(q,point): p=(0.0,point[0],point[1],point[2]); qc=quat_conjugate(q); p_rot=quat_mult(quat_mult(q,p),qc); return (p_rot[1],p_rot[2],p_rot[3])
 
-    # Use global physics_panel_pos for the panel's top-left corner
-    panel_x, panel_y = physics_panel_pos[0], physics_panel_pos[1]
+# --- Physics Panel State & Config ---
+show_physics_panel = False
+PHYSICS_PANEL_WIDTH = cfg.get("UI_PHYSICS_PANEL_WIDTH") # Current width
+physics_panel_content_height = cfg.get("UI_PHYSICS_PANEL_CONTENT_HEIGHT") # Current content area height
+UI_PHYSICS_PANEL_MIN_WIDTH = cfg.get("UI_PHYSICS_PANEL_MIN_WIDTH")
+UI_PHYSICS_PANEL_MAX_WIDTH = cfg.get("UI_PHYSICS_PANEL_MAX_WIDTH")
+UI_PHYSICS_PANEL_MIN_CONTENT_HEIGHT = cfg.get("UI_PHYSICS_PANEL_MIN_CONTENT_HEIGHT")
+UI_PHYSICS_PANEL_MAX_CONTENT_HEIGHT = cfg.get("UI_PHYSICS_PANEL_MAX_CONTENT_HEIGHT")
+PHYSICS_PANEL_COLOR = (40, 40, 60, 230)
+PHYSICS_PANEL_TEXT_COLOR = (220, 220, 220)
+PHYSICS_PANEL_TITLE_BAR_HEIGHT = cfg.get("UI_PHYSICS_PANEL_TITLE_BAR_HEIGHT")
+PHYSICS_PANEL_TITLE_COLOR = tuple(cfg.get("UI_PHYSICS_PANEL_TITLE_COLOR"))
+PHYSICS_PANEL_BORDER_COLOR = tuple(cfg.get("UI_PHYSICS_PANEL_BORDER_COLOR"))
+PHYSICS_PANEL_CLOSE_BTN_SIZE = cfg.get("UI_PHYSICS_PANEL_CLOSE_BTN_SIZE")
+PHYSICS_PANEL_CLOSE_BTN_COLOR = tuple(cfg.get("UI_PHYSICS_PANEL_CLOSE_BTN_COLOR"))
+PHYSICS_PANEL_CLOSE_BTN_HOVER_COLOR = tuple(cfg.get("UI_PHYSICS_PANEL_CLOSE_BTN_HOVER_COLOR"))
+UI_PANEL_RESIZE_HANDLE_SIZE = cfg.get("UI_PANEL_RESIZE_HANDLE_SIZE")
+UI_SCROLLBAR_WIDTH = cfg.get("UI_SCROLLBAR_WIDTH")
+UI_SCROLLBAR_COLOR = tuple(cfg.get("UI_SCROLLBAR_COLOR"))
+UI_SCROLLBAR_HANDLE_COLOR = tuple(cfg.get("UI_SCROLLBAR_HANDLE_COLOR"))
+UI_SCROLLBAR_HANDLE_HOVER_COLOR = tuple(cfg.get("UI_SCROLLBAR_HANDLE_HOVER_COLOR"))
 
-    # Create a surface for the entire panel including title bar
-    total_panel_height = panel_height + PHYSICS_PANEL_TITLE_BAR_HEIGHT
-    panel_surface = pygame.Surface((PHYSICS_PANEL_WIDTH, total_panel_height), pygame.SRCALPHA)
-    
-    # Define padding earlier
+physics_panel_pos = list(cfg.get("PHYSICS_PANEL_POS"))
+dragging_physics_panel = False; physics_panel_drag_start_offset = (0,0)
+dragging_panel_resize = False; panel_resize_drag_start_mouse_pos = (0,0); panel_resize_drag_start_dims = (0,0)
+active_text_input_param_key = None; text_input_string = ""
+dragging_slider_param_key = None # For Phase 2
+physics_panel_scroll = 0; physics_panel_scroll_max = 0
+dragging_scrollbar = False; scrollbar_drag_start_mouse_y = 0; scrollbar_drag_start_scroll_y = 0
+physics_panel_search = ""; physics_panel_show_only_changed = False
+physics_panel_collapsed = False; physics_panel_active_search_box = False
+param_flash_times = {}; FLASH_DURATION = 0.3
+
+# physics_params_config list (as defined before)
+physics_params_config = [
+    {"var_name": "BASE_ACCEL_RATE", "label": "Base Accel Rate", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
+    {"var_name": "FAST_ACCEL_RATE", "label": "Fast Accel Rate", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
+    {"var_name": "BASE_MAX_SPEED_UPS", "label": "Base Max Speed", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
+    {"var_name": "FAST_MAX_SPEED_UPS", "label": "Fast Max Speed", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
+    {"var_name": "DAMPING_FACTOR", "label": "Damping Factor", "min_val": 0.0, "max_val": 20.0, "format_str": "{:.2f}"},
+    {"var_name": "MASS", "label": "Mass", "min_val": 0.1, "max_val": 20.0, "format_str": "{:.1f}"},
+    {"var_name": "STICTION_THRESHOLD", "label": "Stiction Threshold", "min_val": 0.0, "max_val": 5.0, "format_str": "{:.2f}"},
+    {"var_name": "EXTRA_FRICTION", "label": "Extra Friction", "min_val": 0.0, "max_val": 0.5, "format_str": "{:.3f}"},
+    {"var_name": "BASE_SPEED_MULTIPLIER", "label": "Base Speed Multi", "min_val": 0.1, "max_val": 5.0, "format_str": "{:.2f}"},
+    {"var_name": "GRAVITY_ACCEL", "label": "Gravity Accel", "min_val": -100.0, "max_val": -1.0, "format_str": "{:.1f}"},
+    {"var_name": "INITIAL_JUMP_VELOCITY_UPS", "label": "Initial Jump Vel.", "min_val": 1.0, "max_val": 50.0, "format_str": "{:.1f}"},
+    {"var_name": "JUMP_CHARGE_BOOST_ACCEL_RATE", "label": "Jump Charge Boost", "min_val": 0.0, "max_val": 50.0, "format_str": "{:.1f}"},
+    {"var_name": "MAX_JUMP_CHARGE_DURATION", "label": "Max Jump Charge (s)", "min_val": 0.1, "max_val": 3.0, "format_str": "{:.2f}"},
+    {"var_name": "COEFFICIENT_OF_RESTITUTION", "label": "Restitution Coeff.", "min_val": 0.0, "max_val": 1.0, "format_str": "{:.2f}"},
+    {"var_name": "BOUNCE_THRESHOLD", "label": "Bounce Threshold", "min_val": 0.0, "max_val": 20.0, "format_str": "{:.1f}"},
+    {"var_name": "BOUNCE_ON_LAND_VELOCITY_UPS", "label": "Min Bounce Vel.", "min_val": 0.0, "max_val": 10.0, "format_str": "{:.2f}"},
+    {"var_name": "GROUND_CONTACT_THRESHOLD", "label": "Ground Contact Thr.", "min_val": 0.01, "max_val": 1.0, "format_str": "{:.2f}"},
+    {"var_name": "REST_VELOCITY_THRESHOLD", "label": "Rest Velocity Thr.", "min_val": 0.01, "max_val": 2.0, "format_str": "{:.2f}"},
+    {"var_name": "elasticity", "label": "Squish Elasticity", "min_val": 1.0, "max_val": 50.0, "format_str": "{:.1f}"},
+    {"var_name": "SQUISH_ON_JUMP_START", "label": "Squish on Jump", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"},
+    {"var_name": "SQUISH_ON_LANDING", "label": "Base Squish Land", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"},
+    {"var_name": "MAX_SQUISH_FROM_CHARGE", "label": "Max Squish (Charge)", "min_val": 0.1, "max_val": 0.9, "format_str": "{:.2f}"},
+    {"var_name": "SQUISH_DAMPING", "label": "Squish Damping", "min_val": 0.0, "max_val": 30.0, "format_str": "{:.1f}"},
+    {"var_name": "IMPACT_VELOCITY_THRESHOLD", "label": "Impact Vel. Thr.", "min_val": 0.0, "max_val": 20.0, "format_str": "{:.1f}"},
+    {"var_name": "MAX_IMPACT_VELOCITY", "label": "Max Impact Vel.", "min_val": 1.0, "max_val": 100.0, "format_str": "{:.1f}"},
+    {"var_name": "MIN_SQUISH_ON_LANDING", "label": "Min Squish (Land)", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"},
+    {"var_name": "MAX_SQUISH_ON_LANDING", "label": "Max Squish (Land)", "min_val": 0.1, "max_val": 1.0, "format_str": "{:.2f}"},
+    {"var_name": "PLAYER_SCALE_cfg", "label": "Player Scale", "min_val": 0.1, "max_val": 5.0, "format_str": "{:.2f}"},
+    {"var_name": "CULLING_THRESHOLD_cfg", "label": "Culling Threshold", "min_val": -1.0, "max_val": 1.0, "format_str": "{:.3f}"},
+]
+
+def save_param_to_config_and_globals(param_name, value):
+    if param_name in globals(): globals()[param_name] = value
+    cfg.set_param(param_name, value)
+    param_flash_times[param_name] = time.time() + FLASH_DURATION
+def reset_all_physics_params_to_defaults():
+    for param_cfg_item in physics_params_config:
+        var_name = param_cfg_item["var_name"]
+        default_val = cfg.DEFAULT_CONFIG.get(var_name)
+        if default_val is not None:
+            save_param_to_config_and_globals(var_name, default_val)
+    print("All physics parameters reset to defaults.")
+def copy_current_config_to_clipboard():
+    current_config_dict = {}
+    for p_cfg in physics_params_config:
+        current_config_dict[p_cfg["var_name"]] = globals().get(p_cfg["var_name"])
+    # Add other non-panel managed settings
+    current_config_dict["SCREEN_WIDTH"] = SCREEN_WIDTH
+    current_config_dict["SCREEN_HEIGHT"] = SCREEN_HEIGHT
+    current_config_dict["PHYSICS_PANEL_POS"] = physics_panel_pos
+    current_config_dict["UI_PHYSICS_PANEL_WIDTH"] = PHYSICS_PANEL_WIDTH
+    current_config_dict["UI_PHYSICS_PANEL_CONTENT_HEIGHT"] = physics_panel_content_height
+    try:
+        config_json_string = json.dumps(current_config_dict, indent=4, sort_keys=True)
+        if pygame.scrap.get_init(): pygame.scrap.put(pygame.SCRAP_TEXT, config_json_string.encode('utf-8')); print("Current config copied.")
+        else: print("Clipboard not init. Config JSON:\n", config_json_string)
+    except Exception as e: print(f"Clipboard error: {e}. Config JSON:\n", json.dumps(current_config_dict, indent=4, sort_keys=True))
+
+def draw_physics_panel_ui(screen_surf, font_small, font_medium):
+    global physics_panel_scroll, physics_panel_scroll_max, physics_panel_search, \
+           physics_panel_show_only_changed, physics_panel_collapsed, \
+           active_text_input_param_key, text_input_string, dragging_slider_param_key, \
+           physics_panel_active_search_box, \
+           PHYSICS_PANEL_WIDTH, physics_panel_content_height # These can now change
+
+    panel_x, panel_y = physics_panel_pos
     padding = 10
+    current_time_for_flash = time.time()
 
-    # Draw main panel background (content area)
-    panel_surface.fill(PHYSICS_PANEL_COLOR, (0, PHYSICS_PANEL_TITLE_BAR_HEIGHT, PHYSICS_PANEL_WIDTH, panel_height))
+    header_h = PHYSICS_PANEL_TITLE_BAR_HEIGHT
+    search_box_h = 26; buttons_h = 22; spacing_after_search = 4; spacing_after_buttons = padding
+    controls_section_h = search_box_h + spacing_after_search + buttons_h + spacing_after_buttons
     
-    # Draw Title Bar
-    pygame.draw.rect(panel_surface, PHYSICS_PANEL_TITLE_COLOR, (0, 0, PHYSICS_PANEL_WIDTH, PHYSICS_PANEL_TITLE_BAR_HEIGHT))
-    title_text_surf = font.render("Physics Controls (T)", True, PHYSICS_PANEL_TEXT_COLOR)
-    panel_surface.blit(title_text_surf, (padding, (PHYSICS_PANEL_TITLE_BAR_HEIGHT - title_text_surf.get_height()) // 2))
+    actual_content_area_h = 0 if physics_panel_collapsed else physics_panel_content_height
+    total_panel_h = header_h + controls_section_h + actual_content_area_h
     
-    # Draw border around the whole panel
-    pygame.draw.rect(panel_surface, PHYSICS_PANEL_BORDER_COLOR, (0, 0, PHYSICS_PANEL_WIDTH, total_panel_height), 2)
+    panel_surface = pygame.Surface((PHYSICS_PANEL_WIDTH, total_panel_h), pygame.SRCALPHA)
+    panel_surface.fill((0,0,0,0))
 
+    title_bar_rect = pygame.Rect(0, 0, PHYSICS_PANEL_WIDTH, header_h)
+    pygame.draw.rect(panel_surface, PHYSICS_PANEL_TITLE_COLOR, title_bar_rect)
+    title_text_surf = font_medium.render("Physics Controls (T)", True, PHYSICS_PANEL_TEXT_COLOR)
+    panel_surface.blit(title_text_surf, (padding, (header_h - title_text_surf.get_height()) // 2))
 
-    item_y_offset_on_surface = PHYSICS_PANEL_TITLE_BAR_HEIGHT + 15  # Start content below title bar
-    label_line_height = 28
-    slider_track_thickness = 8
-    ruler_markings_area_height = 30
-    item_vertical_spacing = 8
-    # padding = 10 # Moved earlier
+    close_btn_rect_rel = pygame.Rect(PHYSICS_PANEL_WIDTH - PHYSICS_PANEL_CLOSE_BTN_SIZE - 5,
+                                  (header_h - PHYSICS_PANEL_CLOSE_BTN_SIZE) // 2,
+                                  PHYSICS_PANEL_CLOSE_BTN_SIZE, PHYSICS_PANEL_CLOSE_BTN_SIZE)
+    mx_abs, my_abs = pygame.mouse.get_pos()
+    close_btn_abs_coords = close_btn_rect_rel.move(panel_x, panel_y)
+    hover_close = close_btn_abs_coords.collidepoint(mx_abs,my_abs)
+    pygame.draw.rect(panel_surface, PHYSICS_PANEL_CLOSE_BTN_HOVER_COLOR if hover_close else PHYSICS_PANEL_CLOSE_BTN_COLOR, close_btn_rect_rel, border_radius=3)
+    x_font = pygame.font.Font(None, PHYSICS_PANEL_CLOSE_BTN_SIZE + 4)
+    x_surf = x_font.render("×", True, WHITE)
+    panel_surface.blit(x_surf, (close_btn_rect_rel.x + (close_btn_rect_rel.width - x_surf.get_width()) // 2,
+                               close_btn_rect_rel.y + (close_btn_rect_rel.height - x_surf.get_height()) // 2 - 2))
 
-    for param in physics_params_config:
-        item_start_y_on_surface = item_y_offset_on_surface
+    current_y_on_panel = header_h + padding // 2
+    search_box_rect_rel = pygame.Rect(padding, current_y_on_panel, PHYSICS_PANEL_WIDTH - 2 * padding - 95, search_box_h)
+    pygame.draw.rect(panel_surface, (30,30,40) if physics_panel_active_search_box else (20,20,30), search_box_rect_rel, border_radius=3)
+    search_border_c = (200,200,255) if physics_panel_active_search_box else (100,100,120)
+    pygame.draw.rect(panel_surface, search_border_c, search_box_rect_rel, 1, border_radius=3)
+    search_text = physics_panel_search + ("|" if physics_panel_active_search_box and int(current_time_for_flash*2)%2==0 else "")
+    if not physics_panel_search and not physics_panel_active_search_box: search_text = "Search..."
+    search_surf = font_small.render(search_text, True, PHYSICS_PANEL_TEXT_COLOR if physics_panel_search or physics_panel_active_search_box else (120,120,120))
+    panel_surface.blit(search_surf, (search_box_rect_rel.x + 5, search_box_rect_rel.y + (search_box_rect_rel.height - search_surf.get_height()) // 2))
+
+    changed_btn_width = 85
+    changed_btn_rect_rel = pygame.Rect(PHYSICS_PANEL_WIDTH - padding - changed_btn_width, current_y_on_panel, changed_btn_width, search_box_h)
+    changed_btn_abs_coords = changed_btn_rect_rel.move(panel_x, panel_y)
+    hover_changed = changed_btn_abs_coords.collidepoint(mx_abs,my_abs)
+    changed_bg_col = (90,130,190) if hover_changed else ((70,100,150) if physics_panel_show_only_changed else (50,70,100))
+    pygame.draw.rect(panel_surface, changed_bg_col, changed_btn_rect_rel, border_radius=3)
+    changed_text_surf = font_small.render("Changed", True, WHITE if physics_panel_show_only_changed else (180,180,180))
+    panel_surface.blit(changed_text_surf, (changed_btn_rect_rel.centerx - changed_text_surf.get_width()//2,
+                                         changed_btn_rect_rel.centery - changed_text_surf.get_height()//2))
+    current_y_on_panel += search_box_h + spacing_after_search
+
+    btn_spacing = 4; num_buttons = 3
+    btn_w = (PHYSICS_PANEL_WIDTH - 2 * padding - (num_buttons - 1) * btn_spacing) // num_buttons
+    collapse_btn_rect_rel = pygame.Rect(padding, current_y_on_panel, btn_w, buttons_h)
+    copy_btn_rect_rel = pygame.Rect(collapse_btn_rect_rel.right + btn_spacing, current_y_on_panel, btn_w, buttons_h)
+    reset_btn_rect_rel = pygame.Rect(copy_btn_rect_rel.right + btn_spacing, current_y_on_panel, btn_w, buttons_h)
+    hover_collapse = collapse_btn_rect_rel.move(panel_x,panel_y).collidepoint(mx_abs,my_abs)
+    hover_copy = copy_btn_rect_rel.move(panel_x,panel_y).collidepoint(mx_abs,my_abs)
+    hover_reset = reset_btn_rect_rel.move(panel_x,panel_y).collidepoint(mx_abs,my_abs)
+    pygame.draw.rect(panel_surface, (90,130,190) if hover_collapse else (70,100,150), collapse_btn_rect_rel, border_radius=3)
+    pygame.draw.rect(panel_surface, (90,130,190) if hover_copy else (70,100,150), copy_btn_rect_rel, border_radius=3)
+    pygame.draw.rect(panel_surface, (190,110,110) if hover_reset else (150,80,80), reset_btn_rect_rel, border_radius=3)
+    collapse_text_str = "Expand" if physics_panel_collapsed else "Collapse"
+    collapse_surf = font_small.render(collapse_text_str, True, WHITE); copy_surf = font_small.render("Copy Config", True, WHITE); reset_surf = font_small.render("Reset All", True, WHITE)
+    panel_surface.blit(collapse_surf, (collapse_btn_rect_rel.centerx - collapse_surf.get_width()//2, collapse_btn_rect_rel.centery - collapse_surf.get_height()//2))
+    panel_surface.blit(copy_surf, (copy_btn_rect_rel.centerx - copy_surf.get_width()//2, copy_btn_rect_rel.centery - copy_surf.get_height()//2))
+    panel_surface.blit(reset_surf, (reset_btn_rect_rel.centerx - reset_surf.get_width()//2, reset_btn_rect_rel.centery - reset_surf.get_height()//2))
+    current_y_on_panel += buttons_h + spacing_after_buttons
+
+    if not physics_panel_collapsed:
+        param_list_area_y_on_panel = current_y_on_panel
+        param_list_area_h = actual_content_area_h
+        param_list_render_width = PHYSICS_PANEL_WIDTH - (UI_SCROLLBAR_WIDTH + padding//2 if physics_panel_scroll_max > 0 else 0)
         
-        current_item_total_height = label_line_height + item_vertical_spacing + \
-                                    slider_track_thickness + ruler_markings_area_height + \
-                                    item_vertical_spacing
-        if item_y_offset_on_surface + current_item_total_height > total_panel_height: # Check against total panel height
-            break
-
-        # Label
-        label_surf = font.render(param["label"], True, PHYSICS_PANEL_TEXT_COLOR)
-        panel_surface.blit(label_surf, (padding, item_y_offset_on_surface))
-
-        # Value display / Text input
-        current_value = globals().get(param["var_name"], 0.0)
-        value_str = param["format_str"].format(current_value)
+        # Placeholder: Simulate total height of items for scrollbar calculation
+        # In Phase 2, this will be the actual sum of item heights.
+        simulated_total_item_height = 0
+        # For now, let's assume each item (label + slider + ruler) takes about 60 pixels.
+        # Filter params first for accurate count.
+        filtered_params_for_height_calc = [p for p in physics_params_config if not (physics_panel_search and physics_panel_search.lower() not in p["label"].lower()) and not (physics_panel_show_only_changed and math.isclose(globals().get(p["var_name"],0), cfg.DEFAULT_CONFIG.get(p["var_name"],0)))]
+        simulated_total_item_height = len(filtered_params_for_height_calc) * 60 # Rough estimate
         
-        value_text_width_approx = len(value_str) * font.size("0")[0] + 10 
-        value_display_x_on_surface = PHYSICS_PANEL_WIDTH - value_text_width_approx - padding - 60 
-        
-        # Rects are now screen coordinates
-        param["_value_rect"] = pygame.Rect(
-            panel_x + value_display_x_on_surface,
-            panel_y + item_y_offset_on_surface,
-            value_text_width_approx + 50, 
-            label_line_height
-        )
-        
-        if active_text_input_param_key == param["var_name"]:
-            pygame.draw.rect(panel_surface, PHYSICS_TEXT_INPUT_BG_COLOR, (value_display_x_on_surface, item_y_offset_on_surface, param["_value_rect"].width - 10 , label_line_height))
-            pygame.draw.rect(panel_surface, PHYSICS_TEXT_INPUT_BORDER_COLOR, (value_display_x_on_surface, item_y_offset_on_surface, param["_value_rect"].width -10, label_line_height), 1)
-            input_surf = font.render(text_input_string + "|", True, PHYSICS_PANEL_TEXT_COLOR)
-            panel_surface.blit(input_surf, (value_display_x_on_surface + 3, item_y_offset_on_surface + (label_line_height - font.get_height()) // 2))
-        else:
-            value_surf = font.render(value_str, True, PHYSICS_PANEL_TEXT_COLOR)
-            panel_surface.blit(value_surf, (value_display_x_on_surface + 3, item_y_offset_on_surface + (label_line_height - font.get_height()) // 2))
+        physics_panel_scroll_max = max(0, simulated_total_item_height - param_list_area_h)
+        physics_panel_scroll = max(0, min(physics_panel_scroll, physics_panel_scroll_max))
 
-        item_y_offset_on_surface += label_line_height + item_vertical_spacing
+        param_list_subsurface = pygame.Surface((param_list_render_width, param_list_area_h), pygame.SRCALPHA)
+        param_list_subsurface.fill(PHYSICS_PANEL_COLOR)
 
-        # Slider Track
-        slider_x_on_panel_surface = padding + 50 
-        slider_width = PHYSICS_PANEL_WIDTH - slider_x_on_panel_surface - padding - 5 
+        placeholder_y_offset = -physics_panel_scroll
+        for i in range(len(filtered_params_for_height_calc)): # Use count of filtered items
+            item_h = 55; item_spacing = 5 # Placeholder item height
+            ph_rect = pygame.Rect(padding//2, placeholder_y_offset, param_list_render_width - padding, item_h)
+            if ph_rect.bottom > 0 and ph_rect.top < param_list_area_h:
+                pygame.draw.rect(param_list_subsurface, (50 + i*2 % 205, 50 + i*3 % 205, 70 + i*4 % 185), ph_rect, border_radius=2)
+                text_surf = font_small.render(f"Param: {filtered_params_for_height_calc[i]['label']}", True, WHITE)
+                param_list_subsurface.blit(text_surf, (ph_rect.x + 5, ph_rect.y + 5))
+            placeholder_y_offset += item_h + item_spacing
         
-        param["_slider_track_rect"] = pygame.Rect(
-            panel_x + slider_x_on_panel_surface, 
-            panel_y + item_y_offset_on_surface,     
-            slider_width,
-            slider_track_thickness
-        )
-        pygame.draw.rect(panel_surface, PHYSICS_SLIDER_TRACK_COLOR, (slider_x_on_panel_surface, item_y_offset_on_surface, slider_width, slider_track_thickness))
+        panel_surface.blit(param_list_subsurface, (0, param_list_area_y_on_panel))
 
-        # Slider Handle
-        val_ratio = (current_value - param["min_val"]) / (param["max_val"] - param["min_val"] + 1e-6) 
-        val_ratio = max(0, min(1, val_ratio)) 
-        handle_pos_x_on_panel_surface = slider_x_on_panel_surface + val_ratio * slider_width
-        handle_width = 10 
-        handle_height = slider_track_thickness + 6 
-        
-        param["_slider_handle_rect"] = pygame.Rect( 
-            panel_x + handle_pos_x_on_panel_surface - handle_width // 2,
-            panel_y + item_y_offset_on_surface - (handle_height - slider_track_thickness)//2 , 
-            handle_width,
-            handle_height
-        )
-        pygame.draw.rect(panel_surface, PHYSICS_SLIDER_HANDLE_COLOR, (handle_pos_x_on_panel_surface - handle_width // 2, item_y_offset_on_surface - (handle_height - slider_track_thickness)//2 , handle_width, handle_height))
-        
-        # --- Draw ruler ticks under the slider ---
-        ruler_y_on_panel_surface = item_y_offset_on_surface + slider_track_thickness + 2 
-        tick_length = 4
-        for tick_value in [-1000, -750, -500, -250, 0, 250, 500, 750, 1000]:
-            tick_ratio_on_slider = (tick_value + 1000.0) / 2000.0
-            tick_x_on_panel_surface = slider_x_on_panel_surface + tick_ratio_on_slider * slider_width
-            
-            is_center_tick = (tick_value == 0)
-            pygame.draw.line(panel_surface, (255, 255, 255) if is_center_tick else PHYSICS_TEXT_INPUT_BORDER_COLOR, 
-                             (tick_x_on_panel_surface, ruler_y_on_panel_surface), 
-                             (tick_x_on_panel_surface, ruler_y_on_panel_surface + tick_length + (2 if is_center_tick else 0)), 
-                             2 if is_center_tick else 1)
-        
-        ruler_text_y_on_panel_surface = ruler_y_on_panel_surface + tick_length + 3
-        zero_text = font.render("0", True, (255, 255, 255))
-        panel_surface.blit(zero_text, (slider_x_on_panel_surface + slider_width//2 - zero_text.get_width()//2, ruler_text_y_on_panel_surface))
-        
-        left_text = font.render("-50%", True, PHYSICS_TEXT_INPUT_BORDER_COLOR)
-        panel_surface.blit(left_text, (slider_x_on_panel_surface + slider_width//4 - left_text.get_width()//2, ruler_text_y_on_panel_surface))
-        
-        right_text = font.render("+50%", True, PHYSICS_TEXT_INPUT_BORDER_COLOR)
-        panel_surface.blit(right_text, (slider_x_on_panel_surface + 3*slider_width//4 - right_text.get_width()//2, ruler_text_y_on_panel_surface))
+        if physics_panel_scroll_max > 0:
+            scrollbar_track_h = param_list_area_h
+            scrollbar_x = PHYSICS_PANEL_WIDTH - UI_SCROLLBAR_WIDTH - padding // 2
+            pygame.draw.rect(panel_surface, UI_SCROLLBAR_COLOR, (scrollbar_x, param_list_area_y_on_panel, UI_SCROLLBAR_WIDTH, scrollbar_track_h), border_radius=UI_SCROLLBAR_WIDTH//2)
+            handle_h_min = 20
+            handle_h = max(handle_h_min, scrollbar_track_h * (param_list_area_h / simulated_total_item_height) if simulated_total_item_height > 0 else handle_h_min)
+            handle_h = min(handle_h, scrollbar_track_h)
+            scroll_ratio = physics_panel_scroll / physics_panel_scroll_max if physics_panel_scroll_max > 0 else 0
+            handle_y_on_track = scroll_ratio * (scrollbar_track_h - handle_h)
+            handle_rect_rel = pygame.Rect(scrollbar_x, param_list_area_y_on_panel + handle_y_on_track, UI_SCROLLBAR_WIDTH, handle_h)
+            handle_abs_coords = handle_rect_rel.move(panel_x, panel_y)
+            hover_scrollbar_handle = handle_abs_coords.collidepoint(mx_abs, my_abs)
+            handle_col = UI_SCROLLBAR_HANDLE_HOVER_COLOR if hover_scrollbar_handle or dragging_scrollbar else UI_SCROLLBAR_HANDLE_COLOR
+            pygame.draw.rect(panel_surface, handle_col, handle_rect_rel, border_radius=UI_SCROLLBAR_WIDTH//2)
 
-        item_y_offset_on_surface += slider_track_thickness + ruler_markings_area_height
+    resize_handle_rect_rel = pygame.Rect(PHYSICS_PANEL_WIDTH - UI_PANEL_RESIZE_HANDLE_SIZE,
+                                       total_panel_h - UI_PANEL_RESIZE_HANDLE_SIZE,
+                                       UI_PANEL_RESIZE_HANDLE_SIZE, UI_PANEL_RESIZE_HANDLE_SIZE)
+    resize_handle_abs_coords = resize_handle_rect_rel.move(panel_x, panel_y)
+    hover_resize = resize_handle_abs_coords.collidepoint(mx_abs, my_abs)
+    rh_points = [(resize_handle_rect_rel.left, resize_handle_rect_rel.bottom), (resize_handle_rect_rel.right, resize_handle_rect_rel.bottom), (resize_handle_rect_rel.right, resize_handle_rect_rel.top)]
+    pygame.draw.polygon(panel_surface, (150,150,180) if hover_resize or dragging_panel_resize else (100,100,120), rh_points)
 
-        param["_item_row_rect"] = pygame.Rect(
-            panel_x, 
-            panel_y + item_start_y_on_surface, 
-            PHYSICS_PANEL_WIDTH,
-            item_y_offset_on_surface - item_start_y_on_surface 
-        )
-        item_y_offset_on_surface += item_vertical_spacing
+    pygame.draw.rect(panel_surface, PHYSICS_PANEL_BORDER_COLOR, (0,0,PHYSICS_PANEL_WIDTH, total_panel_h), 1)
+    screen_surf.blit(panel_surface, physics_panel_pos)
 
-    screen.blit(panel_surface, (panel_x, panel_y))
-
-# Helper function to save parameter changes to config
-def save_param_to_config(param_name, value):
-    # Update both the global variable and the config file
-    globals()[param_name] = value
-    cfg.set(param_name, value)
-
-# --- Main Game Logic ---
+# --- Main Game Loop ---
 def main():
-    global SCREEN_WIDTH, SCREEN_HEIGHT, GAME_SCREEN_HEIGHT
-    # Initialize single-frame squish event flags to avoid undefined variables
-    jump_initiated_this_frame = False # Default state before loop
-    just_landed_this_frame  = False   # Default state before loop
-    landing_impact_velocity = 0.0     # Default state before loop
-    global zoom, light_direction, player_rotation, light_mode, light_source_pos, \
-           squish, jump_charge_start_time, is_charging_jump, is_on_ground, \
-           target_squish, squish_velocity
-    global cached_ground_surface, cached_ground_zoom, cached_camera_offset  # Added caching globals
-    global show_physics_panel, active_text_input_param_key, text_input_string, dragging_slider_param_key, physics_params_config # Physics panel globals
-    global physics_panel_pos, dragging_physics_panel, physics_panel_drag_start_offset # Draggable panel globals
+    global SCREEN_WIDTH, SCREEN_HEIGHT, GAME_SCREEN_HEIGHT, PLAYER_SCALE_cfg, CULLING_THRESHOLD_cfg
+    global zoom, light_direction, player_rotation, light_mode
+    global squish, jump_charge_start_time, is_charging_jump, is_on_ground, target_squish, squish_velocity
+    global cached_ground_surface, cached_ground_zoom, cached_camera_offset
+    global show_physics_panel, physics_panel_pos, dragging_physics_panel, physics_panel_drag_start_offset, \
+           dragging_panel_resize, panel_resize_drag_start_mouse_pos, panel_resize_drag_start_dims
+    global active_text_input_param_key, text_input_string # dragging_slider_param_key (for phase 2)
+    global physics_panel_scroll, physics_panel_scroll_max, physics_panel_collapsed, physics_panel_search, \
+           physics_panel_show_only_changed, physics_panel_active_search_box, \
+           dragging_scrollbar, scrollbar_drag_start_mouse_y, scrollbar_drag_start_scroll_y
+    global PHYSICS_PANEL_WIDTH, physics_panel_content_height
 
     pygame.init()
-    # Create a resizable window
+    load_physics_params_from_config() # Load all params into globals
+
     screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
-    game_surface = pygame.Surface((SCREEN_WIDTH, GAME_SCREEN_HEIGHT))
+    pygame.display.set_caption("Voxel World - Panel Resizing & Scrolling")
+    try:
+        if not pygame.scrap.get_init(): pygame.scrap.init()
+        if not pygame.scrap.get_init(): print("Warning: Pygame scrap (clipboard) could not be initialized.")
+    except Exception as e: print(f"Clipboard init error: {e}")
+
+    game_surface = pygame.Surface((SCREEN_WIDTH, GAME_SCREEN_HEIGHT), pygame.SRCALPHA)
     toolbar_surface = pygame.Surface((SCREEN_WIDTH, TOOLBAR_HEIGHT))
-    pygame.display.set_caption("Voxel Planetoid Controls - Phase 3")
+    
     clock = pygame.time.Clock()
-    font = pygame.font.Font(None, 24)
-    font_big = pygame.font.Font(None, 48)
+    font_small = pygame.font.Font(None, 20); font_medium = pygame.font.Font(None, 24); font_large = pygame.font.Font(None, 48)
 
-    # Initialize physics_panel_pos based on initial screen size if not already set, or to ensure it's on screen
-    physics_panel_pos[0] = SCREEN_WIDTH - PHYSICS_PANEL_WIDTH - 20 # Default to top-right-ish
-    physics_panel_pos[1] = TOOLBAR_HEIGHT + 20
+    player_voxels_shape = []
+    current_radius = BASE_RADIUS * PLAYER_SCALE_cfg
+    for i in range(-BASE_RADIUS,BASE_RADIUS+1):
+        for j in range(-BASE_RADIUS,BASE_RADIUS+1):
+            for k in range(-BASE_RADIUS,BASE_RADIUS+1):
+                if (i+0.5)**2+(j+0.5)**2+(k+0.5)**2 <= BASE_RADIUS**2*1.05: player_voxels_shape.append((i,j,k,GREEN_BASE))
+    player_voxels_shape.sort(key=lambda v:(v[2],v[1],v[0]))
+    ground_level_z = -1
+    origin_x_base, origin_y_base = SCREEN_WIDTH//2, GAME_SCREEN_HEIGHT//2
+    camera_offset_x, camera_offset_y = 0,0
+    dragging_camera, drag_start_camera = False, (0,0)
+    player_pos_world = [0.0,0.0,float(current_radius if current_radius>0 else 1.0)]
+    player_vel = [0.0,0.0,0.0]; prev_player_xy = (player_pos_world[0],player_pos_world[1])
+    show_help, paused, current_fps = False,False,0.0
+    jump_initiated_this_frame, just_landed_this_frame, landing_impact_velocity = False,False,0.0
 
-    # --- QoL/UX State ---
-    show_help = False
-    paused = False
-    current_fps = 0 # For FPS display
-    player_voxels_shape = [] # Stores (rel_ix, rel_iy, rel_iz_shape, base_color)
-    radius = 6
-    # sphere_vertical_offset was here, removed as unused
-    for i in range(-radius, radius + 1):
-        for j in range(-radius, radius + 1):
-            for k in range(-radius, radius + 1): # k is relative to sphere's center
-                vx, vy, vz = i + 0.5, j + 0.5, k + 0.5
-                if vx**2 + vy**2 + vz**2 <= radius**2 * 1.05:
-                    # Store relative to sphere's own (0,0,0) center for shape definition
-                    player_voxels_shape.append((i, j, k, GREEN_BASE))
-
-    # voxel_set_player_shape was here, removed as unused
-    # Sort the shape definition once (drawing order will be dynamic based on player_pos_world)
-    player_voxels_shape.sort(key=lambda v: (v[2], v[1], v[0]))
-    # Sort the shape definition once (drawing order will be dynamic based on player_pos_world)
-    player_voxels_shape.sort(key=lambda v: (v[2], v[1], v[0]))
-
-    # --- Ground Generation ---
-    ground_voxels_coords = [] # Store (gx, gy, gz)
-    ground_level_z = -1 # Z-index for the top surface of the ground
-    for x_g in range(-GROUND_RANGE, GROUND_RANGE + 1):
-        for y_g in range(-GROUND_RANGE, GROUND_RANGE + 1):
-            ground_voxels_coords.append((x_g, y_g, ground_level_z))
-    # Sort ground for drawing (though only top faces, less critical but good practice)
-    ground_voxels_coords.sort(key=lambda v: (v[2], v[1], v[0]))
-
-    # --- Camera and Player Variables ---
-    origin_x_base = SCREEN_WIDTH // 2
-    origin_y_base = GAME_SCREEN_HEIGHT // 2 # Center game view more
-    camera_offset_x, camera_offset_y = 0, 0
-    dragging_left, drag_start_left = False, (0,0)
-
-    # Player's center position in world voxel indices
-    # Player center uses scaled radius
-    current_radius = BASE_RADIUS * PLAYER_SCALE
-    player_pos_world = [0.0, 0.0, float(current_radius)] # Start with bottom of sphere at z=0
-    player_vel = [0.0, 0.0, 0.0] # Velocities in units/sec
-    prev_player_xy = (player_pos_world[0], player_pos_world[1])
-    # For rolling physics using true 3D rotation, we track the player_rotation quaternion.
-    # It starts with identity and is updated based on horizontal movement.
+    panel_total_h_approx = PHYSICS_PANEL_TITLE_BAR_HEIGHT + physics_panel_content_height + 75
+    physics_panel_pos[0] = max(0, min(physics_panel_pos[0], SCREEN_WIDTH - PHYSICS_PANEL_WIDTH))
+    physics_panel_pos[1] = max(TOOLBAR_HEIGHT, min(physics_panel_pos[1], SCREEN_HEIGHT - panel_total_h_approx))
 
     running = True
     while running:
-        dt = clock.get_time() / 1000.0  # Delta time in seconds
-        current_fps = clock.get_fps() # Get current FPS
+        dt = min(clock.get_time()/1000.0, 0.1); current_time = time.time(); current_fps = clock.get_fps()
+        current_radius = BASE_RADIUS * PLAYER_SCALE_cfg
+        if not pygame.mouse.get_pressed()[2]: dragging_camera = False
+        jump_initiated_this_frame, just_landed_this_frame = False, False
 
-        # Reset per-frame flags at the START of each frame
-        jump_initiated_this_frame = False
-        just_landed_this_frame = False
-        # landing_impact_velocity is set when just_landed_this_frame becomes true,
-        # so it doesn't need explicit resetting here if only used in that context.
-
-        # Update effective player radius from PLAYER_SCALE each frame.
-        current_radius = BASE_RADIUS * PLAYER_SCALE
-
-        # Ensure camera dragging stops when right button is released
-        if not pygame.mouse.get_pressed()[2]:
-            dragging_left = False
-
-        # --- Event Handling ---
         for event in pygame.event.get():
-            if event.type == pygame.QUIT: 
-                running = False
+            if event.type == pygame.QUIT: running = False
             elif event.type == pygame.VIDEORESIZE:
-                SCREEN_WIDTH = event.w
-                SCREEN_HEIGHT = event.h
-                GAME_SCREEN_HEIGHT = SCREEN_HEIGHT - TOOLBAR_HEIGHT
-                screen = pygame.display.set_mode((SCREEN_WIDTH, SCREEN_HEIGHT), pygame.RESIZABLE)
-                game_surface = pygame.Surface((SCREEN_WIDTH, GAME_SCREEN_HEIGHT))
-                toolbar_surface = pygame.Surface((SCREEN_WIDTH, TOOLBAR_HEIGHT))
-                origin_x_base = SCREEN_WIDTH // 2
-                origin_y_base = GAME_SCREEN_HEIGHT // 2
-                # Ensure panel stays on screen after resize
-                physics_panel_pos[0] = max(0, min(physics_panel_pos[0], SCREEN_WIDTH - PHYSICS_PANEL_WIDTH))
-                physics_panel_pos[1] = max(TOOLBAR_HEIGHT, min(physics_panel_pos[1], SCREEN_HEIGHT - (GAME_SCREEN_HEIGHT + PHYSICS_PANEL_TITLE_BAR_HEIGHT))) # Approximate height
-                cached_ground_surface = None
-                cfg.set("SCREEN_WIDTH", SCREEN_WIDTH)
-                cfg.set("SCREEN_HEIGHT", SCREEN_HEIGHT)
-            elif event.type == pygame.KEYDOWN:
-                if active_text_input_param_key:
-                    if event.key == pygame.K_RETURN: # Handle Enter key for text input
-                        try:
-                            new_val = float(text_input_string)
-                            # Clamp value to parameter's defined min/max
-                            for p_cfg in physics_params_config:
-                                if p_cfg["var_name"] == active_text_input_param_key:
-                                    new_val = max(p_cfg["min_val"], min(p_cfg["max_val"], new_val))
-                                    break
-                            # Save to config file as well as updating global variable
-                            save_param_to_config(active_text_input_param_key, new_val)
-                        except ValueError:
-                            pass # Invalid input, ignore
-                        active_text_input_param_key = None # Deactivate text input
-                        text_input_string = ""
-                    elif event.key == pygame.K_ESCAPE:
-                        active_text_input_param_key = None
-                        text_input_string = ""
-                    elif event.key == pygame.K_BACKSPACE:
-                        text_input_string = text_input_string[:-1]
-                    else:
-                        text_input_string += event.unicode
-                else: # No active text input, process regular keys
-                    if event.key == pygame.K_h:
-                        show_help = not show_help
-                    elif event.key == pygame.K_p:
-                        paused = not paused
-                    elif event.key == pygame.K_t: # Toggle physics panel
-                        show_physics_panel = not show_physics_panel
-                        if not show_physics_panel and active_text_input_param_key: # If panel closed with active input
-                            active_text_input_param_key = None
-                            text_input_string = ""
-                    if event.key == pygame.K_SPACE:
-                    # On press, if on ground and not already charging a jump, begin a jump.
-                        if is_on_ground and not is_charging_jump:
-                            player_vel[2] = INITIAL_JUMP_VELOCITY_UPS # Apply initial jump velocity
-                            is_charging_jump = True
-                            jump_charge_start_time = pygame.time.get_ticks() / 1000.0
-                            target_squish = SQUISH_ON_JUMP_START   # Target squish on jump start
-                            is_on_ground = False                   # No longer on ground
-                            jump_initiated_this_frame = True       # Set the flag indicating a jump was initiated
-                    elif event.key == pygame.K_j: light_direction[0] = max(-1, light_direction[0] - 0.1)
-                    elif event.key == pygame.K_l: light_direction[0] = min(1, light_direction[0] + 0.1)
-                    elif event.key == pygame.K_i: light_direction[1] = max(-1, light_direction[1] - 0.1)
-                    elif event.key == pygame.K_k: light_direction[1] = min(1, light_direction[1] + 0.1)
-                    elif event.key == pygame.K_u: light_direction[2] = max(-1, light_direction[2] - 0.1)
-                    elif event.key == pygame.K_o: light_direction[2] = min(1, light_direction[2] + 0.1)
-                    light_direction = normalize_vector(light_direction) # Keep it normalized
-            elif event.type == pygame.MOUSEBUTTONDOWN:
-                if event.button == 3:  # Right click
-                    dragging_left = True
-                    drag_start_left = event.pos
-                mouse_pos = event.pos
-
-                # Physics Panel Interaction (including dragging)
-                panel_event_handled = False
-                if show_physics_panel:
-                    panel_rect_screen = pygame.Rect(physics_panel_pos[0], physics_panel_pos[1], PHYSICS_PANEL_WIDTH, GAME_SCREEN_HEIGHT + PHYSICS_PANEL_TITLE_BAR_HEIGHT)
-                    title_bar_rect_screen = pygame.Rect(physics_panel_pos[0], physics_panel_pos[1], PHYSICS_PANEL_WIDTH, PHYSICS_PANEL_TITLE_BAR_HEIGHT)
-
-                    if event.button == 1: # Left click
-                        if title_bar_rect_screen.collidepoint(mouse_pos):
-                            dragging_physics_panel = True
-                            physics_panel_drag_start_offset = (mouse_pos[0] - physics_panel_pos[0], mouse_pos[1] - physics_panel_pos[1])
-                            panel_event_handled = True # Event handled by starting a drag
-                        elif panel_rect_screen.collidepoint(mouse_pos): # Click is within the panel content area
-                            panel_event_handled = True # Assume click is for a UI element, prevent camera drag
-                            clicked_on_ui_element = False
-                            for param in physics_params_config:
-                                if "_value_rect" in param and param["_value_rect"].collidepoint(mouse_pos):
-                                    if active_text_input_param_key == param["var_name"]:
-                                        pass 
-                                    else: 
-                                        if active_text_input_param_key: 
-                                            try:
-                                                new_val = float(text_input_string)
-                                                for p_cfg_old in physics_params_config:
-                                                    if p_cfg_old["var_name"] == active_text_input_param_key:
-                                                        new_val = max(p_cfg_old["min_val"], min(p_cfg_old["max_val"], new_val))
-                                                        break
-                                                save_param_to_config(active_text_input_param_key, new_val)
-                                            except ValueError: pass 
-                                        active_text_input_param_key = param["var_name"]
-                                        text_input_string = param["format_str"].format(globals()[param["var_name"]]).strip()
-                                    clicked_on_ui_element = True
-                                    break 
-                                elif "_slider_track_rect" in param and param["_slider_track_rect"].collidepoint(mouse_pos):
-                                    dragging_slider_param_key = param["var_name"]
-                                    st_rect = param["_slider_track_rect"]
-                                    click_x_relative_to_track_start = mouse_pos[0] - st_rect.left
-                                    click_ratio = click_x_relative_to_track_start / st_rect.width
-                                    click_ratio = max(0.0, min(1.0, click_ratio))
-                                    raw_ruler_val = -1000.0 + click_ratio * 2000.0
-                                    snap_increment = 250.0
-                                    snapped_ruler_val = round(raw_ruler_val / snap_increment) * snap_increment
-                                    snapped_ruler_val = max(-1000.0, min(1000.0, snapped_ruler_val))
-                                    norm_snapped_ratio = (snapped_ruler_val + 1000.0) / 2000.0
-                                    p_min, p_max = param["min_val"], param["max_val"]
-                                    actual_value = p_min + norm_snapped_ratio * (p_max - p_min)
-                                    try:
-                                        actual_value = float(param["format_str"].format(actual_value))
-                                    except ValueError: pass
-                                    actual_value = max(p_min, min(p_max, actual_value))
-                                    save_param_to_config(param["var_name"], actual_value)
-                                    clicked_on_ui_element = True
-                                    break
-                            
-                            if not clicked_on_ui_element and active_text_input_param_key:
-                                try:
-                                    new_val = float(text_input_string)
-                                    for p_cfg in physics_params_config:
-                                        if p_cfg["var_name"] == active_text_input_param_key:
-                                            new_val = max(p_cfg["min_val"], min(p_cfg["max_val"], new_val))
-                                            break
-                                    save_param_to_config(active_text_input_param_key, new_val)
-                                except ValueError: pass
-                                active_text_input_param_key = None
-                                text_input_string = ""
-                
-                if panel_event_handled:
-                    dragging_left = False # Prevent camera drag if panel was interacted with
-                elif active_text_input_param_key: # Click was outside physics panel (or panel not shown) while input active
-                    try:
-                        new_val = float(text_input_string)
-                        for p_cfg in physics_params_config:
-                            if p_cfg["var_name"] == active_text_input_param_key:
-                                new_val = max(p_cfg["min_val"], min(p_cfg["max_val"], new_val))
-                                break
-                        save_param_to_config(active_text_input_param_key, new_val)
-                    except ValueError: pass
-                    active_text_input_param_key = None
-                    text_input_string = ""
-
-            elif event.type == pygame.MOUSEWHEEL:
-                mouse_pos = pygame.mouse.get_pos()
-                panel_interaction_for_wheel = False
-                if show_physics_panel:
-                    panel_rect_screen = pygame.Rect(physics_panel_pos[0], physics_panel_pos[1], PHYSICS_PANEL_WIDTH, GAME_SCREEN_HEIGHT + PHYSICS_PANEL_TITLE_BAR_HEIGHT)
-                    if panel_rect_screen.collidepoint(mouse_pos): # Mouse wheel over panel
-                        panel_interaction_for_wheel = True # Indicate panel interaction
-                        tuned_param_with_wheel = False
-                        for param in physics_params_config:
-                            if "_item_row_rect" in param and param["_item_row_rect"].collidepoint(mouse_pos):
-                                current_value = globals().get(param["var_name"], 0.0)
-                                p_range = param["max_val"] - param["min_val"]
-                                step = p_range * 0.01 
-                                if abs(step) < 1e-5 : 
-                                    if "f" in param["format_str"]:
-                                        decimals = int(param["format_str"].split('.')[1][0]) if '.' in param["format_str"] else 0
-                                        step = 10**(-decimals)
-                                    else:
-                                        step = 0.01 
-                                if abs(step) < 1e-9 and abs(p_range) < 1e-9 : step = 0.01 
-                                elif abs(step) < 1e-9 : step = p_range * 0.01 if p_range != 0 else 0.01
-                                new_value = current_value + event.y * step
-                                new_value = max(param["min_val"], min(param["max_val"], new_value))
-                                try:
-                                    formatted_new_value = param["format_str"].format(new_value)
-                                    new_value = float(formatted_new_value)
-                                except ValueError:
-                                    pass 
-                                save_param_to_config(param["var_name"], new_value)
-                                tuned_param_with_wheel = True
-                                break 
-                        if not tuned_param_with_wheel: 
-                            # If wheel is over panel but not a specific item, do nothing with zoom
-                            pass
-                
-                if not panel_interaction_for_wheel: # Mouse wheel not over panel, or panel not shown
-                    zoom += event.y * 0.1
-                    zoom = max(0.3, min(2.5, zoom))
-            elif event.type == pygame.KEYUP:
-                if event.key == pygame.K_SPACE:
-                    if is_charging_jump: # If a jump was being charged/boosted
-                        is_charging_jump = False
-                        # jump_charge_start_time will remain until max duration or landing
-            elif event.type == pygame.MOUSEBUTTONUP:
-                if event.button == 3:  # Right click
-                    dragging_left = False  # Stop dragging when the mouse button is released
-                if event.button == 1: # Left mouse button up
-                    dragging_physics_panel = False # Stop dragging physics panel
-                    dragging_slider_param_key = None # Stop dragging slider
-            elif event.type == pygame.MOUSEMOTION:
-                if dragging_physics_panel:
-                    physics_panel_pos[0] = event.pos[0] - physics_panel_drag_start_offset[0]
-                    physics_panel_pos[1] = event.pos[1] - physics_panel_drag_start_offset[1]
-                    # Optional: Clamp panel_pos to stay within screen bounds
-                    physics_panel_pos[0] = max(0, min(physics_panel_pos[0], SCREEN_WIDTH - PHYSICS_PANEL_WIDTH))
-                    physics_panel_pos[1] = max(0, min(physics_panel_pos[1], SCREEN_HEIGHT - (PHYSICS_PANEL_TITLE_BAR_HEIGHT + 20))) # Min height for panel
-                elif dragging_left:
-                    mpos = pygame.mouse.get_pos()
-                    if mpos[1] > TOOLBAR_HEIGHT:
-                        dx, dy = mpos[0] - drag_start_left[0], mpos[1] - drag_start_left[1]
-                        camera_offset_x += dx; camera_offset_y += dy
-                        drag_start_left = mpos
-                if dragging_slider_param_key:
-                    for param in physics_params_config:
-                        if param["var_name"] == dragging_slider_param_key:
-                            st_rect = param["_slider_track_rect"] # Screen coordinates
-                            
-                            click_x_relative_to_track_start = event.pos[0] - st_rect.left
-                            click_ratio = click_x_relative_to_track_start / st_rect.width
-                            click_ratio = max(0.0, min(1.0, click_ratio))
-
-                            raw_ruler_val = -1000.0 + click_ratio * 2000.0
-                            
-                            snap_increment = 250.0
-                            snapped_ruler_val = round(raw_ruler_val / snap_increment) * snap_increment
-                            snapped_ruler_val = max(-1000.0, min(1000.0, snapped_ruler_val))
-                            
-                            norm_snapped_ratio = (snapped_ruler_val + 1000.0) / 2000.0
-                            
-                            p_min, p_max = param["min_val"], param["max_val"]
-                            actual_value = p_min + norm_snapped_ratio * (p_max - p_min)
-                            
-                            try:
-                                actual_value = float(param["format_str"].format(actual_value))
-                            except ValueError: pass
-                            actual_value = max(p_min, min(p_max, actual_value))
-
-                            save_param_to_config(param["var_name"], actual_value)
-                            break
-                # Deactivate slider dragging if mouse button is released (globally, not just for this event type)
-                if not pygame.mouse.get_pressed()[0]: # Check if primary mouse button (usually left) is up
-                    dragging_slider_param_key = None
-
-
-        if paused:
-            # Draw pause overlay and skip updates
-            screen.fill((30, 30, 30))
-            pause_text = font_big.render("Paused", True, (255, 255, 255))
-            screen.blit(pause_text, (SCREEN_WIDTH//2 - pause_text.get_width()//2, SCREEN_HEIGHT//2 - 40))
-            hint_text = font.render("Press P to resume", True, (200, 200, 200))
-            screen.blit(hint_text, (SCREEN_WIDTH//2 - hint_text.get_width()//2, SCREEN_HEIGHT//2 + 10))
-            pygame.display.flip()
-            clock.tick(60)
-            continue
-
-        light_dir_normalized = normalize_vector(light_direction) # Ensure it's normalized for calcs
-
-        keys = pygame.key.get_pressed()
-
-        # --- Movement Physics - XY Plane using Forces (Adjusted Speed) ---
-        current_accel_rate = FAST_ACCEL_RATE if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else BASE_ACCEL_RATE
-        # Apply multiplier to allow a higher base acceleration
-        current_accel_rate *= cfg.get("BASE_SPEED_MULTIPLIER")
-        current_max_speed_ups = FAST_MAX_SPEED_UPS if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else BASE_MAX_SPEED_UPS
-        input_force_x, input_force_y = 0.0, 0.0
-        if keys[pygame.K_a]:
-            input_force_x = -current_accel_rate
-        if keys[pygame.K_d]:
-            input_force_x =  current_accel_rate
-        if keys[pygame.K_w]:
-            input_force_y = -current_accel_rate
-        if keys[pygame.K_s]:
-            input_force_y =  current_accel_rate
-        ground_control_multiplier = 1.2 if is_on_ground else 1.0
-        input_force_x *= ground_control_multiplier
-        input_force_y *= ground_control_multiplier
-
-        # Use a reduced friction factor for smoothing without over-damping:
-        local_friction = 0.015   # decreased from 0.025 to reduce undue slowing
-        friction_force_x = local_friction * player_vel[0]
-        friction_force_y = local_friction * player_vel[1]
-
-        total_force_x = input_force_x - friction_force_x
-        total_force_y = input_force_y - friction_force_y
-
-        # Update velocity using F = ma:
-        player_vel[0] += (total_force_x / MASS) * dt
-        player_vel[1] += (total_force_y / MASS) * dt
-        
-        # Calculate current speed before using it 
-        current_speed_xy = math.hypot(player_vel[0], player_vel[1])
-        
-        # Apply stiction/extra friction to help ball come to a complete stop
-        if current_speed_xy < cfg.get("STICTION_THRESHOLD"):
-            player_vel[0] *= (1 - cfg.get("EXTRA_FRICTION"))
-            player_vel[1] *= (1 - cfg.get("EXTRA_FRICTION"))
-            # If even smaller, snap to zero
-            if current_speed_xy < 0.1:
-                player_vel[0] = 0.0
-                player_vel[1] = 0.0
-
-        # Clamp XY speed to max value:
-        # current_speed_xy already calculated above
-        if current_speed_xy > current_max_speed_ups:
-            scale = current_max_speed_ups / current_speed_xy
-            player_vel[0] *= scale
-            player_vel[1] *= scale
-
-        # --- Jump and Vertical Physics ---
-        current_time = pygame.time.get_ticks() / 1000.0
-        
-        # Apply gravity if not firmly on ground
-        if not is_on_ground:
-            player_vel[2] += GRAVITY_ACCEL * dt
+                SCREEN_WIDTH,SCREEN_HEIGHT=event.w,event.h; GAME_SCREEN_HEIGHT=SCREEN_HEIGHT-TOOLBAR_HEIGHT
+                screen=pygame.display.set_mode((SCREEN_WIDTH,SCREEN_HEIGHT),pygame.RESIZABLE)
+                try: game_surface=pygame.Surface((SCREEN_WIDTH,GAME_SCREEN_HEIGHT),pygame.SRCALPHA); toolbar_surface=pygame.Surface((SCREEN_WIDTH,TOOLBAR_HEIGHT))
+                except pygame.error: game_surface=pygame.Surface((max(100,SCREEN_WIDTH),max(100,GAME_SCREEN_HEIGHT)),pygame.SRCALPHA); toolbar_surface=pygame.Surface((max(100,SCREEN_WIDTH),TOOLBAR_HEIGHT))
+                origin_x_base,origin_y_base=SCREEN_WIDTH//2,GAME_SCREEN_HEIGHT//2
+                PHYSICS_PANEL_WIDTH=max(UI_PHYSICS_PANEL_MIN_WIDTH,min(PHYSICS_PANEL_WIDTH,UI_PHYSICS_PANEL_MAX_WIDTH,SCREEN_WIDTH-20))
+                physics_panel_content_height=max(UI_PHYSICS_PANEL_MIN_CONTENT_HEIGHT,min(physics_panel_content_height,UI_PHYSICS_PANEL_MAX_CONTENT_HEIGHT,SCREEN_HEIGHT-TOOLBAR_HEIGHT-PHYSICS_PANEL_TITLE_BAR_HEIGHT-100))
+                panel_h_approx=PHYSICS_PANEL_TITLE_BAR_HEIGHT+physics_panel_content_height+75
+                physics_panel_pos[0]=max(0,min(physics_panel_pos[0],SCREEN_WIDTH-PHYSICS_PANEL_WIDTH))
+                physics_panel_pos[1]=max(TOOLBAR_HEIGHT,min(physics_panel_pos[1],SCREEN_HEIGHT-panel_h_approx))
+                cfg.set_param("SCREEN_WIDTH",SCREEN_WIDTH); cfg.set_param("SCREEN_HEIGHT",SCREEN_HEIGHT); cached_ground_surface=None
             
-            # Jump boost (if charging jump)
+            panel_event_consumed = False
+            if show_physics_panel:
+                mouse_abs_x, mouse_abs_y = event.pos if hasattr(event,'pos') else pygame.mouse.get_pos()
+                panel_header_h = PHYSICS_PANEL_TITLE_BAR_HEIGHT
+                panel_controls_h = 26+4+22+10
+                panel_current_total_h = panel_header_h + panel_controls_h + (0 if physics_panel_collapsed else physics_panel_content_height)
+                close_btn_abs_rect = pygame.Rect(physics_panel_pos[0]+PHYSICS_PANEL_WIDTH-PHYSICS_PANEL_CLOSE_BTN_SIZE-5, physics_panel_pos[1]+(panel_header_h-PHYSICS_PANEL_CLOSE_BTN_SIZE)//2, PHYSICS_PANEL_CLOSE_BTN_SIZE,PHYSICS_PANEL_CLOSE_BTN_SIZE)
+                title_bar_abs_rect = pygame.Rect(physics_panel_pos[0],physics_panel_pos[1],PHYSICS_PANEL_WIDTH,panel_header_h)
+                resize_handle_abs_rect = pygame.Rect(physics_panel_pos[0]+PHYSICS_PANEL_WIDTH-UI_PANEL_RESIZE_HANDLE_SIZE, physics_panel_pos[1]+panel_current_total_h-UI_PANEL_RESIZE_HANDLE_SIZE, UI_PANEL_RESIZE_HANDLE_SIZE,UI_PANEL_RESIZE_HANDLE_SIZE)
+                param_list_abs_y_start = physics_panel_pos[1]+panel_header_h+panel_controls_h
+                param_list_abs_h = 0 if physics_panel_collapsed else physics_panel_content_height
+                scrollbar_track_abs_rect, scrollbar_handle_abs_rect = None,None
+                if not physics_panel_collapsed and physics_panel_scroll_max > 0 and param_list_abs_h > 0: # Ensure param_list_abs_h is positive
+                    scrollbar_x_abs = physics_panel_pos[0]+PHYSICS_PANEL_WIDTH-UI_SCROLLBAR_WIDTH-10//2
+                    scrollbar_track_abs_rect = pygame.Rect(scrollbar_x_abs,param_list_abs_y_start,UI_SCROLLBAR_WIDTH,param_list_abs_h)
+                    sim_total_h = param_list_abs_h + 300 # Placeholder
+                    handle_h = max(20, param_list_abs_h*(param_list_abs_h/sim_total_h) if sim_total_h > 0 else 20)
+                    handle_h = min(handle_h, param_list_abs_h)
+                    scroll_ratio = physics_panel_scroll/physics_panel_scroll_max if physics_panel_scroll_max > 0 else 0
+                    handle_y_on_track = scroll_ratio*(param_list_abs_h-handle_h)
+                    scrollbar_handle_abs_rect = pygame.Rect(scrollbar_x_abs,param_list_abs_y_start+handle_y_on_track,UI_SCROLLBAR_WIDTH,handle_h)
+
+                if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+                    if close_btn_abs_rect.collidepoint(mouse_abs_x,mouse_abs_y): show_physics_panel=False; cfg.set_param("PHYSICS_PANEL_POS",physics_panel_pos); cfg.set_param("UI_PHYSICS_PANEL_WIDTH",PHYSICS_PANEL_WIDTH); cfg.set_param("UI_PHYSICS_PANEL_CONTENT_HEIGHT",physics_panel_content_height); active_text_input_param_key=None; physics_panel_active_search_box=False; panel_event_consumed=True
+                    elif resize_handle_abs_rect.collidepoint(mouse_abs_x,mouse_abs_y): dragging_panel_resize=True; panel_resize_drag_start_mouse_pos=(mouse_abs_x,mouse_abs_y); panel_resize_drag_start_dims=(PHYSICS_PANEL_WIDTH,physics_panel_content_height); panel_event_consumed=True
+                    elif scrollbar_handle_abs_rect and scrollbar_handle_abs_rect.collidepoint(mouse_abs_x,mouse_abs_y): dragging_scrollbar=True; scrollbar_drag_start_mouse_y=mouse_abs_y; scrollbar_drag_start_scroll_y=physics_panel_scroll; panel_event_consumed=True
+                    elif scrollbar_track_abs_rect and scrollbar_track_abs_rect.collidepoint(mouse_abs_x,mouse_abs_y): relative_y_on_track=mouse_abs_y-scrollbar_track_abs_rect.top; scroll_ratio_clicked=relative_y_on_track/scrollbar_track_abs_rect.height if scrollbar_track_abs_rect.height > 0 else 0; physics_panel_scroll=scroll_ratio_clicked*physics_panel_scroll_max; physics_panel_scroll=max(0,min(physics_panel_scroll,physics_panel_scroll_max)); panel_event_consumed=True
+                    elif title_bar_abs_rect.collidepoint(mouse_abs_x,mouse_abs_y): dragging_physics_panel=True; physics_panel_drag_start_offset=(mouse_abs_x-physics_panel_pos[0],mouse_abs_y-physics_panel_pos[1]); panel_event_consumed=True
+                    else: # Check other panel buttons (simplified)
+                        # This needs to map to the rects drawn in draw_physics_panel_ui
+                        # Example for search box:
+                        search_box_rel = pygame.Rect(10, panel_header_h + 10//2, PHYSICS_PANEL_WIDTH - 2*10 - 95, 26)
+                        if search_box_rel.move(physics_panel_pos[0], physics_panel_pos[1]).collidepoint(mouse_abs_x, mouse_abs_y):
+                            physics_panel_active_search_box = True; active_text_input_param_key = None; panel_event_consumed = True
+                        # ... similar checks for "Changed", "Collapse", "Copy", "Reset" ...
+                        # If click is within panel but not on a specific control:
+                        elif pygame.Rect(physics_panel_pos[0], physics_panel_pos[1], PHYSICS_PANEL_WIDTH, panel_current_total_h).collidepoint(mouse_abs_x, mouse_abs_y):
+                            if active_text_input_param_key: active_text_input_param_key = None; text_input_string = ""
+                            if physics_panel_active_search_box: physics_panel_active_search_box = False
+                            panel_event_consumed = True
+                elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
+                    if dragging_panel_resize: dragging_panel_resize=False; cfg.set_param("UI_PHYSICS_PANEL_WIDTH",PHYSICS_PANEL_WIDTH); cfg.set_param("UI_PHYSICS_PANEL_CONTENT_HEIGHT",physics_panel_content_height)
+                    dragging_physics_panel=False; dragging_scrollbar=False
+                elif event.type == pygame.MOUSEMOTION:
+                    if dragging_panel_resize: dx,dy=mouse_abs_x-panel_resize_drag_start_mouse_pos[0],mouse_abs_y-panel_resize_drag_start_mouse_pos[1]; PHYSICS_PANEL_WIDTH=panel_resize_drag_start_dims[0]+dx; physics_panel_content_height=panel_resize_drag_start_dims[1]+dy; PHYSICS_PANEL_WIDTH=max(UI_PHYSICS_PANEL_MIN_WIDTH,min(PHYSICS_PANEL_WIDTH,UI_PHYSICS_PANEL_MAX_WIDTH)); physics_panel_content_height=max(UI_PHYSICS_PANEL_MIN_CONTENT_HEIGHT,min(physics_panel_content_height,UI_PHYSICS_PANEL_MAX_CONTENT_HEIGHT)); cached_ground_surface=None; panel_event_consumed=True
+                    elif dragging_physics_panel: physics_panel_pos[0]=mouse_abs_x-physics_panel_drag_start_offset[0]; physics_panel_pos[1]=mouse_abs_y-physics_panel_drag_start_offset[1]; panel_h_approx=panel_header_h+physics_panel_content_height+75; physics_panel_pos[0]=max(0,min(physics_panel_pos[0],SCREEN_WIDTH-PHYSICS_PANEL_WIDTH)); physics_panel_pos[1]=max(TOOLBAR_HEIGHT,min(physics_panel_pos[1],SCREEN_HEIGHT-panel_h_approx)); panel_event_consumed=True
+                    elif dragging_scrollbar and scrollbar_track_abs_rect and scrollbar_track_abs_rect.height > 0: mouse_y_delta=mouse_abs_y-scrollbar_drag_start_mouse_y; scroll_delta_ratio=mouse_y_delta/scrollbar_track_abs_rect.height; physics_panel_scroll=scrollbar_drag_start_scroll_y+scroll_delta_ratio*physics_panel_scroll_max; physics_panel_scroll=max(0,min(physics_panel_scroll,physics_panel_scroll_max)); panel_event_consumed=True
+                elif event.type == pygame.MOUSEWHEEL and not physics_panel_collapsed:
+                    param_list_content_abs_rect = pygame.Rect(physics_panel_pos[0],param_list_abs_y_start,PHYSICS_PANEL_WIDTH,param_list_abs_h)
+                    if param_list_content_abs_rect.collidepoint(mouse_abs_x,mouse_abs_y): physics_panel_scroll-=event.y*30; physics_panel_scroll=max(0,min(physics_panel_scroll,physics_panel_scroll_max)); panel_event_consumed=True
+                elif event.type == pygame.KEYDOWN and (physics_panel_active_search_box): # or active_text_input_param_key
+                    if physics_panel_active_search_box:
+                        if event.key==pygame.K_ESCAPE: physics_panel_active_search_box=False; physics_panel_search=""
+                        elif event.key==pygame.K_BACKSPACE: physics_panel_search=physics_panel_search[:-1]
+                        elif event.key==pygame.K_RETURN: physics_panel_active_search_box=False
+                        else: physics_panel_search+=event.unicode
+                        physics_panel_scroll=0
+                    panel_event_consumed=True
+            if panel_event_consumed: continue
+
+            # General game event handling (as before)
+            if event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_h: show_help = not show_help
+                elif event.key == pygame.K_p: paused = not paused
+                elif event.key == pygame.K_t:
+                    show_physics_panel = not show_physics_panel
+                    if not show_physics_panel: cfg.set_param("PHYSICS_PANEL_POS",physics_panel_pos); cfg.set_param("UI_PHYSICS_PANEL_WIDTH",PHYSICS_PANEL_WIDTH); cfg.set_param("UI_PHYSICS_PANEL_CONTENT_HEIGHT",physics_panel_content_height)
+                    else: panel_h_approx=PHYSICS_PANEL_TITLE_BAR_HEIGHT+physics_panel_content_height+75; physics_panel_pos[0]=max(0,min(physics_panel_pos[0],SCREEN_WIDTH-PHYSICS_PANEL_WIDTH)); physics_panel_pos[1]=max(TOOLBAR_HEIGHT,min(physics_panel_pos[1],SCREEN_HEIGHT-panel_h_approx))
+                elif event.key == pygame.K_ESCAPE:
+                    if show_physics_panel: show_physics_panel=False; cfg.set_param("PHYSICS_PANEL_POS",physics_panel_pos); cfg.set_param("UI_PHYSICS_PANEL_WIDTH",PHYSICS_PANEL_WIDTH); cfg.set_param("UI_PHYSICS_PANEL_CONTENT_HEIGHT",physics_panel_content_height)
+                    elif show_help: show_help=False
+                elif event.key == pygame.K_c: camera_offset_x,camera_offset_y,zoom=0,0,1.0; cached_ground_surface=None
+                elif event.key == pygame.K_m: light_mode = not light_mode
+                elif event.key == pygame.K_SPACE:
+                    if is_on_ground and not is_charging_jump: player_vel[2]=INITIAL_JUMP_VELOCITY_UPS; is_on_ground=False; is_charging_jump=True; jump_charge_start_time=current_time; jump_initiated_this_frame=True; target_squish=SQUISH_ON_JUMP_START
+            elif event.type == pygame.KEYUP and event.key == pygame.K_SPACE and is_charging_jump: is_charging_jump=False; jump_charge_start_time=None
+            elif event.type == pygame.MOUSEBUTTONDOWN:
+                if event.button == 3 and event.pos[1] > TOOLBAR_HEIGHT: dragging_camera=True; drag_start_camera=(event.pos[0]-camera_offset_x,event.pos[1]-camera_offset_y)
+                elif event.button == 1 and light_mode and event.pos[1] > TOOLBAR_HEIGHT: light_dir_x=event.pos[0]-SCREEN_WIDTH//2; light_dir_y=event.pos[1]-GAME_SCREEN_HEIGHT//2; light_direction=normalize_vector([-light_dir_x,-light_dir_y,200]); light_mode=False; cached_ground_surface=None
+            elif event.type == pygame.MOUSEBUTTONUP and event.button == 3: dragging_camera=False
+            elif event.type == pygame.MOUSEMOTION and dragging_camera and event.pos[1] > TOOLBAR_HEIGHT: camera_offset_x=event.pos[0]-drag_start_camera[0]; camera_offset_y=event.pos[1]-drag_start_camera[1]; cached_ground_surface=None
+            elif event.type == pygame.MOUSEWHEEL: zoom_factor=1.1 if event.y>0 else 1/1.1; zoom*=zoom_factor; zoom=max(0.1,min(zoom,5.0)); cached_ground_surface=None
+
+        if not paused:
+            # --- Full Physics Update (using global parameters) ---
+            keys = pygame.key.get_pressed()
+            accel_input = [0.0, 0.0]
+            current_accel_rate_val = FAST_ACCEL_RATE if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else BASE_ACCEL_RATE
+            current_max_speed_val = FAST_MAX_SPEED_UPS if keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT] else BASE_MAX_SPEED_UPS
+            current_max_speed_val *= BASE_SPEED_MULTIPLIER
+            if keys[pygame.K_w]: accel_input[1] -= 1
+            if keys[pygame.K_s]: accel_input[1] += 1
+            if keys[pygame.K_a]: accel_input[0] -= 1
+            if keys[pygame.K_d]: accel_input[0] += 1
+            accel_mag = math.hypot(accel_input[0], accel_input[1])
+            if accel_mag > 0: accel_input = [ (a / accel_mag) * current_accel_rate_val for a in accel_input]
+            else: accel_input = [0.0, 0.0]
+            player_vel[0] += accel_input[0] * dt; player_vel[1] += accel_input[1] * dt
+            speed_xy = math.hypot(player_vel[0], player_vel[1])
+            if speed_xy > 0:
+                damping_force_x = -player_vel[0] / speed_xy * DAMPING_FACTOR
+                damping_force_y = -player_vel[1] / speed_xy * DAMPING_FACTOR
+                player_vel[0] += damping_force_x * dt; player_vel[1] += damping_force_y * dt
+            if accel_mag == 0:
+                player_vel[0] *= (1.0 - EXTRA_FRICTION); player_vel[1] *= (1.0 - EXTRA_FRICTION)
+                if speed_xy < STICTION_THRESHOLD: player_vel[0] = 0.0; player_vel[1] = 0.0
+            current_speed_xy_check = math.hypot(player_vel[0], player_vel[1]) # Use a different var name
+            if current_speed_xy_check > current_max_speed_val:
+                scale = current_max_speed_val / current_speed_xy_check
+                player_vel[0] *= scale; player_vel[1] *= scale
+            if not is_on_ground: player_vel[2] += GRAVITY_ACCEL * dt
             if is_charging_jump and keys[pygame.K_SPACE] and jump_charge_start_time is not None:
                 charge_duration = current_time - jump_charge_start_time
-                if charge_duration < MAX_JUMP_CHARGE_DURATION:
-                    player_vel[2] += JUMP_CHARGE_BOOST_ACCEL_RATE * dt
-                    # Squish deepens with charge (visual feedback)
-                    charge_progress = charge_duration / MAX_JUMP_CHARGE_DURATION
-                    squish_from_charge = SQUISH_ON_JUMP_START - charge_progress * (SQUISH_ON_JUMP_START - MAX_SQUISH_FROM_CHARGE)
-                    target_squish = min(target_squish, squish_from_charge)
-                else: # Max charge reached
-                    is_charging_jump = False
+                if charge_duration < MAX_JUMP_CHARGE_DURATION: player_vel[2] += JUMP_CHARGE_BOOST_ACCEL_RATE * dt
+                else: is_charging_jump = False
+            player_pos_world[0]+=player_vel[0]*dt; player_pos_world[1]+=player_vel[1]*dt; player_pos_world[2]+=player_vel[2]*dt
+            player_bottom_z = player_pos_world[2] - current_radius
+            if player_bottom_z <= ground_level_z + GROUND_CONTACT_THRESHOLD:
+                if not is_on_ground:
+                    just_landed_this_frame = True; landing_impact_velocity = abs(player_vel[2])
+                    if landing_impact_velocity > BOUNCE_THRESHOLD: player_vel[2] = landing_impact_velocity * COEFFICIENT_OF_RESTITUTION
+                    else: player_vel[2] = 0; player_pos_world[2] = ground_level_z + current_radius
+                else: player_vel[2] = 0; player_pos_world[2] = ground_level_z + current_radius
+                is_on_ground = True
+            else: is_on_ground = False
+            if is_on_ground and abs(player_vel[2]) < REST_VELOCITY_THRESHOLD: player_vel[2] = 0.0
+            dx_world = player_pos_world[0]-prev_player_xy[0]; dy_world = player_pos_world[1]-prev_player_xy[1]
+            prev_player_xy = (player_pos_world[0],player_pos_world[1])
+            if is_on_ground and (abs(dx_world)>1e-5 or abs(dy_world)>1e-5) and current_radius > 1e-5:
+                dist_moved=math.hypot(dx_world,dy_world); angle_rolled=dist_moved/current_radius
+                roll_axis=normalize_vector((-dy_world,dx_world,0))
+                if roll_axis!=(0,0,0):
+                    delta_rot=quat_from_axis_angle(roll_axis,angle_rolled); player_rotation=quat_mult(delta_rot,player_rotation)
+                    norm_sq=sum(c*c for c in player_rotation)
+                    if norm_sq>1e-9: player_rotation=tuple(c/math.sqrt(norm_sq) for c in player_rotation)
+            if jump_initiated_this_frame: target_squish = SQUISH_ON_JUMP_START
+            elif just_landed_this_frame:
+                norm_impact=0
+                if MAX_IMPACT_VELOCITY > IMPACT_VELOCITY_THRESHOLD: norm_impact = (landing_impact_velocity - IMPACT_VELOCITY_THRESHOLD) / (MAX_IMPACT_VELOCITY - IMPACT_VELOCITY_THRESHOLD)
+                norm_impact=max(0,min(1,norm_impact))
+                target_squish = MIN_SQUISH_ON_LANDING - norm_impact * (MIN_SQUISH_ON_LANDING - MAX_SQUISH_ON_LANDING)
+                target_squish=max(0.1,min(1.0,target_squish))
+            elif is_on_ground and not is_charging_jump: target_squish = 1.0
+            squish_force=elasticity*(target_squish-squish); damping_squish_force=SQUISH_DAMPING*squish_velocity
+            squish_accel=squish_force-damping_squish_force; squish_velocity+=squish_accel*dt; squish+=squish_velocity*dt
+            squish=max(0.1,min(2.0,squish))
 
-        # Update position (all axes)
-        # prev_pos = player_pos_world.copy() # This was unused
-        for i in range(3): player_pos_world[i] += player_vel[i] * dt
-        
-        # --- Ground Collision Detection ---
-        player_bottom_z = player_pos_world[2] - current_radius
-        ground_surface_z = ground_level_z + 1 # Top of the ground voxels
-        
-        # Check if player has hit the ground
-        if player_bottom_z < ground_surface_z:
-            # Store the previous velocity before correction for impact calculation
-            impact_velocity = -player_vel[2]  # Capture downward velocity (as positive number)
-            
-            # Correct position to be exactly on ground
-            player_pos_world[2] = ground_surface_z + current_radius
-            
-            # Handle landing
-            if not is_on_ground: # This means it *wasn't* on ground, and now it is
-                just_landed_this_frame = True # Set the flag indicating landing this frame
-                landing_impact_velocity = impact_velocity
-                
-                # Calculate impact strength as a factor from 0.0 to 1.0
-                impact_factor = min(1.0, max(0.0, (impact_velocity - IMPACT_VELOCITY_THRESHOLD) / 
-                                              (MAX_IMPACT_VELOCITY - IMPACT_VELOCITY_THRESHOLD)))
-                
-                # Scale squish amount based on impact factor
-                if impact_velocity > IMPACT_VELOCITY_THRESHOLD:
-                    # More forceful impact = more squish (lower value)
-                    impact_squish = MIN_SQUISH_ON_LANDING - impact_factor * (MIN_SQUISH_ON_LANDING - MAX_SQUISH_ON_LANDING)
-                    target_squish = impact_squish
-                    
-                    # Apply bounce scaled by impact and coefficient of restitution
-                    player_vel[2] = -impact_velocity * COEFFICIENT_OF_RESTITUTION
-                    
-                    # Visual feedback - squish harder with higher impacts
-                    squish_velocity = (target_squish - squish) * 15.0  # Increased for faster response
-                else:
-                    # Gentle landing
-                    player_vel[2] = 0
-                    target_squish = 0.98  # Very slight squish
-                
-                # End any active jump charging
-                is_charging_jump = False
-            
-            # Set ground contact state
-            is_on_ground = True
-        else:
-            # Not in contact with ground
-            if is_on_ground and player_vel[2] > 0:  # Moving upward away from ground
-                is_on_ground = False
-            elif is_on_ground:
-                # Small tolerance for ground contact to prevent jitter
-                if player_bottom_z > ground_surface_z + GROUND_CONTACT_THRESHOLD:
-                    is_on_ground = False
-        
-        # When firmly on ground and not actively moving, ensure stability
-        if is_on_ground:
-            if current_speed_xy < REST_VELOCITY_THRESHOLD and not is_charging_jump:
-                player_vel[2] = 0  # Cancel any lingering vertical velocity
-            
-            if abs(player_vel[2]) < 0.1:
-                player_vel[2] = 0  # Avoid tiny bounces
-        
-        # --- Update Squish ---
-        if jump_initiated_this_frame:
-            target_squish = SQUISH_ON_JUMP_START
-        elif just_landed_this_frame:
-            target_squish = SQUISH_ON_LANDING if landing_impact_velocity > BOUNCE_THRESHOLD else 0.98
-        elif is_charging_jump:
-            if keys[pygame.K_SPACE] and jump_charge_start_time is not None:
-                charge_duration = current_time - jump_charge_start_time
-                if charge_duration < MAX_JUMP_CHARGE_DURATION:
-                    progress = charge_duration / MAX_JUMP_CHARGE_DURATION
-                    target_squish = SQUISH_ON_JUMP_START - progress * (SQUISH_ON_JUMP_START - MAX_SQUISH_FROM_CHARGE)
-                else:
-                    target_squish = MAX_SQUISH_FROM_CHARGE
-        else:
-            # Much faster recovery rate for more responsive feel
-            target_squish += (1.0 - target_squish) * 10.0 * dt
-         
-        # Increase to 10.0 for more responsive spring
-        _spring = (target_squish - squish) * 10.0
-        _damp   = squish_velocity * SQUISH_DAMPING
-        _accel  = _spring - _damp
-        squish_velocity += _accel * dt
-        squish += squish_velocity * dt
-        squish = max(MAX_SQUISH_FROM_CHARGE * 0.95, min(1.05, squish))
-        if abs(squish - 1.0) < 0.01 and abs(squish_velocity) < 0.1:
-            squish = 1.0
-            squish_velocity = 0.0
-            if not (jump_initiated_this_frame or just_landed_this_frame or is_charging_jump):
-                target_squish = 1.0
+        game_surface.fill(BLACK); toolbar_surface.fill(TOOLBAR_COLOR)
+        draw_origin_x, draw_origin_y = origin_x_base+camera_offset_x, origin_y_base+camera_offset_y
+        if cached_ground_surface is None or cached_ground_zoom!=zoom or abs(cached_camera_offset[0]-camera_offset_x)>GROUND_CACHE_MARGIN/4 or abs(cached_camera_offset[1]-camera_offset_y)>GROUND_CACHE_MARGIN/4:
+            cached_ground_surface = render_ground_surface(zoom, ground_level_z) # Pass only zoom and z
+            cached_ground_zoom=zoom; cached_camera_offset=(camera_offset_x,camera_offset_y)
+        blit_x = draw_origin_x - cached_ground_surface.get_width()//2 # Center cache on draw_origin
+        blit_y = draw_origin_y - cached_ground_surface.get_height()//2
+        game_surface.blit(cached_ground_surface, (blit_x, blit_y))
 
-        # --- Update True 3D Rolling Rotation via Quaternion ---
-        new_player_xy = (player_pos_world[0], player_pos_world[1])
-        dx = new_player_xy[0] - prev_player_xy[0]
-        dy = new_player_xy[1] - prev_player_xy[1]
-        distance = math.hypot(dx, dy)
-        
-        # Only update rotation if there's significant movement
-        # This prevents micro-jitters in rotation when nearly stationary
-        if distance > 0.05:
-            # Invert roll direction by using (-dy, dx) instead of (dy, -dx)
-            axis = (-dy, dx, 0)
-            norm = math.hypot(axis[0], axis[1])
-            if norm > 0:
-                axis = (axis[0]/norm, axis[1]/norm, 0)
-                angle = distance / current_radius  # rotation angle in radians
-                q_increment = quat_from_axis_angle(axis, angle)
-                player_rotation = quat_mult(q_increment, player_rotation)
-                
-                # Normalize the quaternion occasionally to prevent drift
-                quat_mag = math.sqrt(sum(x*x for x in player_rotation))
-                if abs(quat_mag - 1.0) > 0.01:
-                    player_rotation = tuple(x/quat_mag for x in player_rotation)
-
-        prev_player_xy = new_player_xy
-
-        # --- Drawing ---
-        game_surface.fill(BLACK)
-        draw_origin_x = origin_x_base + camera_offset_x
-        draw_origin_y = origin_y_base + camera_offset_y
-
-        # --- Draw Ground and Grid using Cached Surface ---
-        # Re-render cached ground surface only if zoom or camera offset have changed significantly.
-        if (cached_ground_surface is None or zoom != cached_ground_zoom or  # Use global zoom
-            abs(camera_offset_x - (cached_camera_offset[0] or 0)) > 10 or 
-            abs(camera_offset_y - (cached_camera_offset[1] or 0)) > 10):
-            cached_ground_surface = render_ground_surface(draw_origin_x, draw_origin_y, zoom, ground_level_z) # Pass global zoom and ground_level_z
-            cached_ground_zoom = zoom # Use global zoom
-            cached_camera_offset = (camera_offset_x, camera_offset_y)
-        # Blit the cached ground surface to game_surface at proper offset.
-        game_surface.blit(cached_ground_surface, (0, 0))
-
-        # Draw Player Shadow
-        shadow_world_z_on_ground = ground_level_z + 1 # Top surface of ground
-        if abs(light_dir_normalized[2]) > 0.01: # Avoid division by zero if light is horizontal
-            # Light ray: ShadowPos = PlayerPos - t * LightDirNormalized (if light dir points TO the object)
-            # Or: ShadowPos = PlayerPos + t * (-LightDirNormalized) (if light dir points FROM the light source)
-            # Let's assume light_direction points FROM the light source.
-            # ShadowPos.z = player_pos_world[2] + t * (-light_dir_normalized[2]) = shadow_world_z_on_ground
-            # t * (-light_dir_normalized[2]) = shadow_world_z_on_ground - player_pos_world[2]
-            # t = (shadow_world_z_on_ground - player_pos_world[2]) / (-light_dir_normalized[2])
-            
-            # If light_dir_normalized[2] is positive (light from above), t should be positive
-            # If light_dir_normalized[2] is negative (light from below), shadow is above or t is negative
-            if light_dir_normalized[2] > 0.01: # Light has downward component
-                t = (player_pos_world[2] - (current_radius) - shadow_world_z_on_ground) / light_dir_normalized[2]
-                shadow_world_x = player_pos_world[0] - t * light_dir_normalized[0]
-                shadow_world_y = player_pos_world[1] - t * light_dir_normalized[1]
-            else: # Light is horizontal or from below, shadow is complex or not on ground plane
-                shadow_world_x = player_pos_world[0] # Default to directly below
-                shadow_world_y = player_pos_world[1]
-        else: # Light is perfectly horizontal
-            shadow_world_x = player_pos_world[0]
-            shadow_world_y = player_pos_world[1]
-
-        shadow_proj_x, shadow_proj_y = project_iso(shadow_world_x, shadow_world_y, shadow_world_z_on_ground, zoom)
-        shadow_screen_x = int(shadow_proj_x + draw_origin_x)
-        shadow_screen_y = int(shadow_proj_y + draw_origin_y)
-        height_above_shadow_plane = max(0, (player_pos_world[2] - current_radius) - shadow_world_z_on_ground)
-        shadow_alpha = max(0, 120 - height_above_shadow_plane * 8) # Adjusted alpha fade
-        shadow_size_factor = max(0.1, 1 - height_above_shadow_plane * 0.05) # Adjusted size fade
-        
-        shadow_base_width = int(VOXEL_SIZE * current_radius * 0.8 * zoom * shadow_size_factor)
-        shadow_base_height = int(VOXEL_SIZE * current_radius * 0.4 * zoom * shadow_size_factor)
-        if shadow_alpha > 5 and shadow_base_width > 1 and shadow_base_height > 1:
-            shadow_surf = pygame.Surface((shadow_base_width, shadow_base_height), pygame.SRCALPHA)
-            pygame.draw.ellipse(shadow_surf, (0, 0, 0, shadow_alpha), (0, 0, shadow_base_width, shadow_base_height))
-            game_surface.blit(shadow_surf, (shadow_screen_x - shadow_base_width // 2, shadow_screen_y - shadow_base_height // 2))
-
-        # Draw Player Sphere (voxels relative to player_pos_world)
-        temp_player_draw_list = []
+        # Player Rendering (as before)
+        player_render_voxels = []
+        effective_squish_xy = 1.0 / squish if squish != 0 else 1.0
         for rel_ix, rel_iy, rel_iz_shape, base_color in player_voxels_shape:
-            rotated = quat_rotate_point(player_rotation, (rel_ix, rel_iy, rel_iz_shape))
-            scaled = (rotated[0] * (1.0/squish) * PLAYER_SCALE, rotated[1] * (1.0/squish) * PLAYER_SCALE, rotated[2] * squish * PLAYER_SCALE)
-            abs_ix = scaled[0] + player_pos_world[0]
-            abs_iy = scaled[1] + player_pos_world[1]
-            abs_iz = scaled[2] + player_pos_world[2]
-            temp_player_draw_list.append({'abs_pos': (abs_ix, abs_iy, abs_iz), 'color': base_color, 'rel_coords': (rel_ix, rel_iy, rel_iz_shape)})
-
-        temp_player_draw_list.sort(key=lambda v: v['abs_pos'][2])
-        faces_drawn_count = 0 # For debugging culling effectiveness
-
-        for voxel_data in temp_player_draw_list:
-            abs_ix, abs_iy, abs_iz = voxel_data['abs_pos']
-            base_color = voxel_data['color']
-            
-            # Voxel's bottom-left-back corner in world space for face point calculation
-            voxel_blb_x, voxel_blb_y, voxel_blb_z = abs_ix - 0.5, abs_iy - 0.5, abs_iz - 0.5
-
-            for face_key, base_normal in FACE_NORMALS.items():
-                rotated_normal = quat_rotate_point(player_rotation, base_normal)
-                
-                # --- Back-face Culling ---
-                dot_product_view = (rotated_normal[0] * VIEW_DIRECTION_FOR_CULLING[0] +
-                                    rotated_normal[1] * VIEW_DIRECTION_FOR_CULLING[1] +
-                                    rotated_normal[2] * VIEW_DIRECTION_FOR_CULLING[2])
-                if dot_product_view <= CULLING_THRESHOLD: # If normal is pointing away from camera or too parallel
-                    continue
-                
-                faces_drawn_count +=1
-                face_indices = get_voxel_face_points_from_indices(voxel_blb_x, voxel_blb_y, voxel_blb_z, face_key)
-                # No need to check 'if face_indices:' as get_voxel_face_points_from_indices always returns points now
-
-                shaded_color = compute_face_color_with_normal(base_color, rotated_normal, light_dir_normalized)
-                raw_proj_pts = [project_iso(p[0], p[1], p[2], zoom) for p in face_indices]
-                shifted = [(int(p[0] + draw_origin_x), int(p[1] + draw_origin_y)) for p in raw_proj_pts]
-                pygame.draw.polygon(game_surface, shaded_color, shifted)
-
-        # --- Draw Toolbar as Clickable UI ---
-        toolbar_surface.fill(TOOLBAR_COLOR)
-        # Draw light icon (a simple circle) at right side:
-        light_icon_rect = pygame.Rect(SCREEN_WIDTH - 50, 5, 40, 30)
-        mouse_pos = pygame.mouse.get_pos()
-        mouse_over_icon = light_icon_rect.collidepoint(mouse_pos)
-        pygame.draw.ellipse(toolbar_surface, WHITE, light_icon_rect, 2)
-        if light_mode or mouse_over_icon:
-            pygame.draw.ellipse(toolbar_surface, (255, 255, 0) if light_mode else (180, 180, 0), light_icon_rect, 0)
-
-        # Draw state information for debugging
-        lt = f"Light: X{light_direction[0]:.1f} Y{light_direction[1]:.1f} Z{light_direction[2]:.1f}"
-        t_s = font.render(lt, True, TEXT_COLOR)
-        toolbar_surface.blit(t_s, (5, 5))
-
-        fps_text = f"FPS: {current_fps:.0f}" # Display FPS
-        fps_s = font.render(fps_text, True, TEXT_COLOR)
-        toolbar_surface.blit(fps_s, (SCREEN_WIDTH - 280, 5)) # Adjusted position for FPS
-
-        zt = f"Zoom: {zoom:.2f}x"
-        z_s = font.render(zt, True, TEXT_COLOR)
-        toolbar_surface.blit(z_s, (SCREEN_WIDTH - 200, 5))
-
-        state_color = (120, 255, 120) if is_on_ground else TEXT_COLOR
-        pt = f"Pos: X{player_pos_world[0]:.1f} Y{player_pos_world[1]:.1f} Z{player_pos_world[2]:.1f}"
-        p_s = font.render(pt, True, state_color)
-        toolbar_surface.blit(p_s, (5, 20))
-
-        st = f"Speed: {current_speed_xy:.1f}  Jump: {'CHARGE' if is_charging_jump else ('ON GROUND' if is_on_ground else 'AIR')}  Squish: {squish:.2f}" # Faces: {faces_drawn_count}"
-        s_s = font.render(st, True, TEXT_COLOR)
-        toolbar_surface.blit(s_s, (SCREEN_WIDTH - 450, 20)) # Adjusted position
-
-        # --- Draw help overlay if toggled ---
-        if show_help:
-            help_lines = [
-                "Controls:",
-                "WASD: Roll/Move",
-                "Space: Jump / Hold for higher jump",
-                "Shift: Sprint",
-                "Mouse Drag: Pan Camera",
-                "Mouse Wheel: Zoom",
-                "Click Lightbulb: Set Light Source",
-                "H: Toggle Help   P: Pause",
-                "",
-                "Tip: The ball rolls with momentum. Use gentle steering for curves!"
-            ]
-            help_bg = pygame.Surface((400, 220))
-            help_bg.set_alpha(220)
-            help_bg.fill((30, 30, 30))
-            screen.blit(help_bg, (SCREEN_WIDTH//2 - 200, 80))
-            for i, line in enumerate(help_lines):
-                txt = font.render(line, True, (255, 255, 180) if i == 0 else (220, 220, 220))
-                screen.blit(txt, (SCREEN_WIDTH//2 - 190, 90 + i*24))
-
-        screen.blit(toolbar_surface, (0, 0))
+            s_rel_x, s_rel_y, s_rel_z = rel_ix * PLAYER_SCALE_cfg, rel_iy * PLAYER_SCALE_cfg, rel_iz_shape * PLAYER_SCALE_cfg * squish
+            rot_sub_voxel_rel = quat_rotate_point(player_rotation, (s_rel_x, s_rel_y, s_rel_z))
+            vx,vy,vz = player_pos_world[0]+rot_sub_voxel_rel[0], player_pos_world[1]+rot_sub_voxel_rel[1], player_pos_world[2]+rot_sub_voxel_rel[2]
+            player_render_voxels.append(((vx,vy,vz), base_color))
+        player_render_voxels.sort(key=lambda item: (item[0][2], item[0][1], item[0][0]), reverse=True)
+        for (voxel_w_center_x, voxel_w_center_y, voxel_w_center_z), base_color in player_render_voxels:
+            for face_key, unrot_normal in FACE_NORMALS.items():
+                world_face_normal = normalize_vector(quat_rotate_point(player_rotation, unrot_normal))
+                dot_view_normal = sum(n*v for n,v in zip(world_face_normal, VIEW_DIRECTION_FOR_CULLING))
+                if dot_view_normal > CULLING_THRESHOLD_cfg:
+                    unit_corners = VOXEL_CORNER_OFFSETS[face_key]
+                    face_pts_3d = []
+                    for off_x,off_y,off_z in unit_corners:
+                        lc_x,lc_y,lc_z = off_x-0.5, off_y-0.5, off_z-0.5
+                        sl_x,sl_y,sl_z = lc_x*PLAYER_SCALE_cfg, lc_y*PLAYER_SCALE_cfg, lc_z*PLAYER_SCALE_cfg*squish
+                        rot_lc = quat_rotate_point(player_rotation, (sl_x,sl_y,sl_z))
+                        wc_x,wc_y,wc_z = voxel_w_center_x+rot_lc[0], voxel_w_center_y+rot_lc[1], voxel_w_center_z+rot_lc[2]
+                        face_pts_3d.append((wc_x,wc_y,wc_z))
+                    poly_2d = [ (int(sx+draw_origin_x), int(sy+draw_origin_y)) for sx,sy in 
+                                [project_iso(p[0],p[1],p[2],zoom) for p in face_pts_3d] ]
+                    face_col = compute_face_color_with_normal(base_color, world_face_normal, light_direction)
+                    pygame.draw.polygon(game_surface, face_col, poly_2d)
+        
         screen.blit(game_surface, (0, TOOLBAR_HEIGHT))
+        help_txt_str = f"H:Help P:Pause T:Tune Esc:Close C:CamReset M:LightMode FPS:{current_fps:.0f}"
+        help_surf = font_medium.render(help_txt_str, True, TEXT_COLOR)
+        toolbar_surface.blit(help_surf, (10, (TOOLBAR_HEIGHT - help_surf.get_height()) // 2))
+        settings_btn_rect_tb = pygame.Rect(SCREEN_WIDTH - 160, (TOOLBAR_HEIGHT - 24)//2, 32, 24)
+        pygame.draw.rect(toolbar_surface, (80,120,180), settings_btn_rect_tb, border_radius=5)
+        settings_icon_font = pygame.font.Font(None,28); settings_icon_surf = settings_icon_font.render("⚙", True,WHITE)
+        toolbar_surface.blit(settings_icon_surf, (settings_btn_rect_tb.centerx - settings_icon_surf.get_width()//2, settings_btn_rect_tb.centery - settings_icon_surf.get_height()//2))
+        reset_player_btn_rect_tb = pygame.Rect(SCREEN_WIDTH - 120, (TOOLBAR_HEIGHT - 24)//2, 110, 24)
+        pygame.draw.rect(toolbar_surface, (180,100,100), reset_player_btn_rect_tb, border_radius=5)
+        reset_player_text_surf = font_medium.render("Reset Player",True,WHITE)
+        toolbar_surface.blit(reset_player_text_surf, (reset_player_btn_rect_tb.centerx - reset_player_text_surf.get_width()//2, reset_player_btn_rect_tb.centery - reset_player_text_surf.get_height()//2))
+        screen.blit(toolbar_surface, (0,0))
 
-        # --- Draw Physics Tuning Panel (on top of everything else) ---
-        if show_physics_panel:
-            # panel_x_pos and panel_y_pos are now taken from global physics_panel_pos
-            panel_content_height = GAME_SCREEN_HEIGHT # Height for the scrollable content area
-            draw_physics_panel(screen, font, panel_content_height)
+        if show_physics_panel: draw_physics_panel_ui(screen, font_small, font_medium)
+        if show_help:
+            help_s = pygame.Surface((SCREEN_WIDTH, GAME_SCREEN_HEIGHT), pygame.SRCALPHA); help_s.fill((0,0,0,180))
+            help_text_lines = ["--- Controls ---", "WASD: Move", "Shift: Sprint", "Space: Jump (Hold to boost)", "Mouse Wheel: Zoom", "RMB Drag: Pan Camera", "C: Reset Camera", "H: Help", "P: Pause", "T: Tune Physics", "Esc: Close UI / Exit Input", "M: Light Mode"]
+            for i, line in enumerate(help_text_lines): line_surf = font_medium.render(line, True, WHITE); help_s.blit(line_surf, (50, 50 + i * 30))
+            screen.blit(help_s, (0,TOOLBAR_HEIGHT))
+        if paused:
+            pause_s = pygame.Surface((SCREEN_WIDTH, GAME_SCREEN_HEIGHT), pygame.SRCALPHA); pause_s.fill((0,0,0,120))
+            pause_text = font_large.render("PAUSED", True, WHITE)
+            pause_s.blit(pause_text, (SCREEN_WIDTH//2 - pause_text.get_width()//2, GAME_SCREEN_HEIGHT//2 - pause_text.get_height()//2))
+            screen.blit(pause_s, (0,TOOLBAR_HEIGHT))
 
         pygame.display.flip()
         clock.tick(60)
-    pygame.quit()
 
-if __name__ == "__main__":
+    if show_physics_panel: # Save panel state on quit
+        cfg.set_param("PHYSICS_PANEL_POS", physics_panel_pos)
+        cfg.set_param("UI_PHYSICS_PANEL_WIDTH", PHYSICS_PANEL_WIDTH)
+        cfg.set_param("UI_PHYSICS_PANEL_CONTENT_HEIGHT", physics_panel_content_height)
+    pygame.quit()
+    sys.exit()
+
+if __name__ == '__main__':
     main()
